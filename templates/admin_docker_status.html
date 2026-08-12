@@ -1,0 +1,283 @@
+{% extends 'admin/base.html' %}
+{% block content %}
+<div class="jumbotron">
+    <div class="container">
+        <h1>Docker Status</h1>
+        <p class="mb-0">Monitor active challenge instances, lifecycle policy, and recent control-plane actions.</p>
+    </div>
+</div>
+<div class="container">
+    <div class="row mb-4">
+        <div class="col-md-3">
+            <div class="card h-100">
+                <div class="card-body">
+                    <div class="text-muted small">Revert Cooldown</div>
+                    <div class="h4 mb-0">{{ settings_summary.revert_cooldown }}s</div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card h-100">
+                <div class="card-body">
+                    <div class="text-muted small">Instance TTL</div>
+                    <div class="h4 mb-0">{{ settings_summary.container_ttl }}s</div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card h-100">
+                <div class="card-body">
+                    <div class="text-muted small">Max Active / Participant</div>
+                    <div class="h4 mb-0">{{ settings_summary.max_active if settings_summary.max_active else "Unlimited" }}</div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card h-100">
+                <div class="card-body">
+                    <div class="text-muted small">Published Port Range</div>
+                    <div class="h4 mb-0">{{ settings_summary.port_min }}-{{ settings_summary.port_max }}</div>
+                    <div class="small text-muted mt-2">
+                        Reaper every {{ settings_summary.reaper_interval }}s
+                        {% if settings_summary.reaper_last_run %}
+                        <br>Last run: {{ settings_summary.reaper_last_run | datetimeformat }}
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row">
+        <div class="col-md-12">
+            <div class="card mb-4">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <strong>Active Instances</strong>
+                    <button type="button" class="btn btn-danger btn-sm" onclick="check_nuke_container(null, true)">Nuke All Containers</button>
+                </div>
+                <div class="card-body">
+                    {% if dockers %}
+                    <div class="table-responsive">
+                        <table id="dockers" class="table table-striped">
+                            <thead>
+                                <tr>
+                                    <th class="text-center" style="cursor: pointer;" onclick="sortTable(0)">ID</th>
+                                    <th style="cursor: pointer;" onclick="sortTable(1)">{{ "Team" if team_mode else "User" }}</th>
+                                    <th style="cursor: pointer;" onclick="sortTable(2)">Challenge</th>
+                                    <th style="cursor: pointer;" onclick="sortTable(3)">Service</th>
+                                    <th style="cursor: pointer;" onclick="sortTable(4)">State</th>
+                                    <th style="cursor: pointer;" onclick="sortTable(5)">Docker Image</th>
+                                    <th style="cursor: pointer;" onclick="sortTable(6)">Ports</th>
+                                    <th style="cursor: pointer;" onclick="sortTable(7)">Instance ID</th>
+                                    <th style="cursor: pointer;" onclick="sortTable(8)">Start Time</th>
+                                    <th style="cursor: pointer;" onclick="sortTable(9)">Expires</th>
+                                    <th class="text-center">Revoke</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for docker in dockers %}
+                                <tr id="tr_{{ docker.instance_id }}" name="{{ docker.id }}">
+                                    <td class="text-left">{{ docker.id }}</td>
+                                    <td class="text-left">{{ docker.participant }}</td>
+                                    <td class="text-left" style="white-space: nowrap;">{{ docker.challenge }}</td>
+                                    <td class="text-left" style="white-space: nowrap;">{{ docker.service_name or "-" }}</td>
+                                    <td class="text-left"><span class="badge badge-info">{{ docker.state }}</span></td>
+                                    <td class="text-left" style="white-space: nowrap;">{{ docker.docker_image }}</td>
+                                    <td class="text-left" style="white-space: nowrap;">{{ docker.ports | join(", ") if docker.ports else "internal only" }}</td>
+                                    <td class="text-left">{{ docker.instance_id | truncate(15) }}</td>
+                                    <td class="text-left" style="white-space: nowrap;">{{ docker.timestamp | datetimeformat }}</td>
+                                    <td class="text-left" style="white-space: nowrap;">{{ docker.expires_at | datetimeformat }}</td>
+                                    <td class="text-center"><a id="delete_{{ docker.instance_id }}" style="cursor: pointer;" class="fas fa-trash" onclick="check_nuke_container('{{ docker.instance_id }}', false)"></a></td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                    {% else %}
+                    <h5 class="text-center mb-0">No Docker containers are currently active.</h5>
+                    {% endif %}
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header"><strong>Recent Audit Log</strong></div>
+                <div class="card-body">
+                    {% if audit_logs %}
+                    <div class="table-responsive">
+                        <table class="table table-sm table-hover">
+                            <thead>
+                                <tr>
+                                    <th>Time</th>
+                                    <th>Action</th>
+                                    <th>Status</th>
+                                    <th>Actor</th>
+                                    <th>Owner</th>
+                                    <th>Challenge</th>
+                                    <th>Service</th>
+                                    <th>Details</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for item in audit_logs %}
+                                <tr>
+                                    <td style="white-space: nowrap;">{{ item.timestamp | datetimeformat }}</td>
+                                    <td>{{ item.action }}</td>
+                                    <td>
+                                        <span class="badge badge-{{ 'success' if item.status == 'success' else 'danger' }}">
+                                            {{ item.status }}
+                                        </span>
+                                    </td>
+                                    <td>{{ item.actor_name or item.actor_role }}</td>
+                                    <td>{{ item.owner_name or item.owner_id or "-" }}</td>
+                                    <td>{{ item.challenge_name or item.challenge_id or "-" }}</td>
+                                    <td>{{ item.service_name or item.instance_id or item.stack_id or "-" }}</td>
+                                    <td>{{ item.message or "-" }}</td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                    {% else %}
+                    <h5 class="text-center mb-0">No audit events recorded yet.</h5>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock content %}
+{% block scripts %}
+<script>
+function sortTable(n) {
+    var table = document.getElementById("dockers");
+    if (!table) {
+        return;
+    }
+    var rows;
+    var switching = true;
+    var dir = "asc";
+    var switchcount = 0;
+    while (switching) {
+        switching = false;
+        rows = table.rows;
+        for (var i = 1; i < (rows.length - 1); i++) {
+            var shouldSwitch = false;
+            var x = rows[i].getElementsByTagName("TD")[n];
+            var y = rows[i + 1].getElementsByTagName("TD")[n];
+            if (dir === "asc") {
+                if (x.innerHTML.toLowerCase() > y.innerHTML.toLowerCase()) {
+                    shouldSwitch = true;
+                    break;
+                }
+            } else if (dir === "desc") {
+                if (x.innerHTML.toLowerCase() < y.innerHTML.toLowerCase()) {
+                    shouldSwitch = true;
+                    break;
+                }
+            }
+        }
+        if (shouldSwitch) {
+            rows[i].parentNode.insertBefore(rows[i + 1], rows[i]);
+            switching = true;
+            switchcount++;
+        } else if (switchcount === 0 && dir === "asc") {
+            dir = "desc";
+            switching = true;
+        }
+    }
+}
+
+function check_nuke_container(instance, all) {
+    ezq({
+        title: "Attention!",
+        body: "Are you sure you want to revoke this Docker instance?",
+        success: function() { nuke_container(instance, all); },
+    });
+}
+
+function nuke_container(instance, all) {
+    fetch("/api/v1/nuke", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+            container: instance,
+            all: all
+        })
+    }).then(function(response) {
+        if (response.ok) {
+            window.location = "{{ script_root }}/admin/docker_status";
+            return;
+        }
+        ezal({
+            title: "Attention!",
+            body: "Error when deleting Docker container",
+            button: "Got it!"
+        });
+    }).catch(function() {
+        ezal({
+            title: "Attention!",
+            body: "Error when deleting Docker container",
+            button: "Got it!"
+        });
+    });
+}
+
+var modal =
+    '<div class="modal fade" tabindex="-1" role="dialog">' +
+    '  <div class="modal-dialog" role="document">' +
+    '    <div class="modal-content">' +
+    '      <div class="modal-header">' +
+    '        <h5 class="modal-title">{0}</h5>' +
+    '        <button type="button" class="close" data-dismiss="modal" aria-label="Close">' +
+    '          <span aria-hidden="true">&times;</span>' +
+    '        </button>' +
+    '      </div>' +
+    '      <div class="modal-body">' +
+    '        <p>{1}</p>' +
+    '      </div>' +
+    '      <div class="modal-footer"></div>' +
+    '    </div>' +
+    '  </div>' +
+    '</div>';
+
+function ezq(args) {
+    var res = modal.format(args.title, args.body);
+    var obj = $(res);
+    var deny = '<button type="button" class="btn btn-danger" data-dismiss="modal">No</button>';
+    var confirm = $('<button type="button" class="btn btn-primary" data-dismiss="modal">Yes</button>');
+
+    obj.find(".modal-footer").append(deny);
+    obj.find(".modal-footer").append(confirm);
+    $("main").append(obj);
+
+    $(obj).on("hidden.bs.modal", function() {
+        $(this).modal("dispose");
+    });
+
+    $(confirm).click(function() {
+        args.success();
+    });
+
+    obj.modal("show");
+    return obj;
+}
+
+function ezal(args) {
+    var res = modal.format(args.title, args.body);
+    var obj = $(res);
+    var button = '<button type="button" class="btn btn-primary" data-dismiss="modal">{0}</button>'.format(args.button);
+
+    obj.find(".modal-footer").append(button);
+    $("main").append(obj);
+    obj.modal("show");
+
+    $(obj).on("hidden.bs.modal", function() {
+        $(this).modal("dispose");
+    });
+
+    return obj;
+}
+</script>
+{% endblock scripts %}

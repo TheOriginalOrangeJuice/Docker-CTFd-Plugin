@@ -1,0 +1,79 @@
+{% extends "admin/challenges/update.html" %}
+{% block category %}
+<div class="form-group">
+    <label>
+        Category<br>
+        <small class="form-text text-muted">Challenge Category</small>
+    </label>
+    <input type="text" class="form-control chal-category" name="category" value="{{ challenge.category }}">
+</div>
+<div class="form-group">
+    <label>Challenge Mode:</label>
+    <div class="form-check form-check-inline">
+        <input class="form-check-input" type="radio" name="docker_mode" id="mode_single" value="single"
+               {% if not challenge.compose_content %}checked{% endif %}>
+        <label class="form-check-label" for="mode_single">Single Image</label>
+    </div>
+    <div class="form-check form-check-inline">
+        <input class="form-check-input" type="radio" name="docker_mode" id="mode_compose" value="compose"
+               {% if challenge.compose_content %}checked{% endif %}>
+        <label class="form-check-label" for="mode_compose">Compose Stack</label>
+    </div>
+</div>
+<div class="form-group" id="single_image_group" {% if challenge.compose_content %}style="display:none;"{% endif %}>
+    <label for="DockerImage" id='dockerimage_label'>Docker Image:
+        <i class="far fa-question-circle text-muted cursor-help" data-toggle="tooltip" data-placement="right" title="The docker image for your challenge"></i>
+    </label>
+    <select id="dockerimage_select" name="docker_image" class="form-control" {% if not challenge.compose_content %}required{% endif %}></select>
+</div>
+<div class="form-group" id="single_ports_group" {% if challenge.compose_content %}style="display:none;"{% endif %}>
+    <label for="docker_ports_select">Published Container Ports:</label>
+    <select id="docker_ports_select" name="published_ports" class="form-control" size="5" multiple {% if not challenge.compose_content %}required{% endif %}></select>
+    <input type="hidden" name="published_ports_present" value="1">
+    <small class="form-text text-muted">
+        Select the image ports players should be able to reach. The plugin assigns a different host port to each instance.
+    </small>
+</div>
+<div class="form-group" id="compose_group" {% if not challenge.compose_content %}style="display:none;"{% endif %}>
+    <label for="compose_content">Docker Compose YAML:
+        <i class="far fa-question-circle text-muted cursor-help" data-toggle="tooltip" data-placement="right"
+           title="Services with 'ports:' will be exposed to the player. Services without ports are internal only. {{HOST}}, {{PORT}}, and {{PORT_service}} placeholders are supported inside environment values, command, and entrypoint."></i>
+    </label>
+    <small class="form-text text-muted">
+        Supported extras: <code>cpus</code> and <code>mem_limit</code> per service. Unsupported host-level options such as <code>volumes</code>, <code>privileged</code>, and <code>build</code> are rejected.
+    </small>
+    <textarea id="compose_content" name="compose_content" class="form-control" rows="15"
+              style="font-family: monospace; font-size: 12px;">{{ challenge.compose_content or '' }}</textarea>
+</div>
+<div class="form-group">
+    <label>Flag Mode:</label>
+    <div class="form-check form-check-inline">
+        <input class="form-check-input" type="radio" name="flag_mode" id="flag_mode_static" value="static"
+               {% if (challenge.flag_mode or 'static') != 'hmac' %}checked{% endif %}>
+        <label class="form-check-label" for="flag_mode_static">Standard CTFd Flags</label>
+    </div>
+    <div class="form-check form-check-inline">
+        <input class="form-check-input" type="radio" name="flag_mode" id="flag_mode_hmac" value="hmac"
+               {% if challenge.flag_mode == 'hmac' %}checked{% endif %}>
+        <label class="form-check-label" for="flag_mode_hmac">Per-Participant HMAC Flag</label>
+    </div>
+    <small class="form-text text-muted">
+        HMAC mode injects <code>CTFD_FLAG</code> into the container or compose services and validates a deterministic per-participant flag.
+    </small>
+</div>
+<div class="form-group" id="flag_template_group" {% if challenge.flag_mode != 'hmac' %}style="display:none;"{% endif %}>
+    <label for="flag_template">Dynamic Flag Template</label>
+    <input type="text" class="form-control" id="flag_template" name="flag_template" value="{% if challenge.flag_template %}{{ challenge.flag_template }}{% else %}{% raw %}flag{{HMAC}}{% endraw %}{% endif %}">
+    <small class="form-text text-muted">
+        Include the <code>{% raw %}{{HMAC}}{% endraw %}</code> placeholder exactly once, for example <code>{% raw %}flag{{HMAC}}{% endraw %}</code> or <code>{% raw %}pctf{user-{{HMAC}}}{% endraw %}</code>.
+    </small>
+</div>
+{% endblock %}
+{% block footer %}
+<script>
+var DOCKER_IMAGE = {{ challenge.docker_image | tojson }};
+var COMPOSE_CONTENT = {{ challenge.compose_content | tojson if challenge.compose_content else 'null' }};
+var PUBLISHED_PORTS = {{ challenge.published_ports | tojson if challenge.published_ports else 'null' }};
+var FLAG_MODE = {{ (challenge.flag_mode or 'static') | tojson }};
+</script>
+{% endblock %}

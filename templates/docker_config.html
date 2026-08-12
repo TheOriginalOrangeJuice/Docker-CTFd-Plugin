@@ -1,0 +1,123 @@
+{% extends 'admin/base.html' %}
+{% block content %}
+<div class="jumbotron">
+    <div class="container">
+        <h1>Docker Config</h1>
+        <p class="mb-0">Configure the Docker control plane, repository allow-list, and default instance lifecycle limits.</p>
+    </div>
+</div>
+<div class="container">
+    <div class="row">
+        <div class="col-md-8 offset-md-2">
+            {% for error in errors %}
+            <div class="alert alert-danger alert-dismissable" role="alert">
+                <span class="sr-only">Error:</span>
+                {{ error }}
+                <button type="button" class="close" data-dismiss="alert" aria-label="Close"><span aria-hidden="true">×</span></button>
+            </div>
+            {% endfor %}
+            <form method="post" accept-charset="utf-8" autocomplete="off" role="form" name="docker_config" class="form-horizontal" enctype="multipart/form-data">
+                <div class="card mb-4">
+                    <div class="card-header"><strong>Docker API</strong></div>
+                    <div class="card-body">
+                        <div class="form-group">
+                            <label for="hostname-input">Docker Host</label>
+                            <small class="form-text text-muted mb-2">Use <code>host:port</code> only, for example <code>dockerproxy:2375</code> for a same-host proxy.</small>
+                            <input class="form-control" type="text" name="hostname" id="hostname-input" placeholder="Ex: dockerproxy:2375" value="{{ config.hostname if config and config.hostname else '' }}" />
+                        </div>
+                        <div class="form-group">
+                            <p class="mb-2">TLS Enabled?</p>
+                            <div class="form-check form-check-inline">
+                                <input type="radio" name="tls_enabled" id="tls-radiobox-no" value="False" onclick="enable_file_form(!this.checked)" {% if not config or not config.tls_enabled %}checked{% endif %} />
+                                <label for="tls-radiobox-no">No</label>
+                            </div>
+                            <div class="form-check form-check-inline">
+                                <input type="radio" name="tls_enabled" id="tls-radiobox-yes" value="True" onclick="enable_file_form(this.checked)" {% if config and config.tls_enabled %}checked{% endif %} />
+                                <label for="tls-radiobox-yes">Yes</label>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="ca-file">CA Cert {% if config and config.ca_cert %}(uploaded; a new file will overwrite it){% endif %}</label>
+                            <input class="form-control" type="file" name="ca_cert" id="ca_file" {% if not config or not config.tls_enabled %}disabled{% endif %} {% if config and config.tls_enabled and not config.ca_cert %}required{% endif %} />
+                        </div>
+                        <div class="form-group">
+                            <label for="client-file">Client Cert {% if config and config.client_cert %}(uploaded; a new file will overwrite it){% endif %}</label>
+                            <input class="form-control" type="file" name="client_cert" id="client_file" {% if not config or not config.tls_enabled %}disabled{% endif %} {% if config and config.tls_enabled and not config.client_cert %}required{% endif %} />
+                        </div>
+                        <div class="form-group mb-0">
+                            <label for="key-file">Client Key {% if config and config.client_key %}(uploaded; a new file will overwrite it){% endif %}</label>
+                            <input class="form-control" type="file" name="client_key" id="key_file" {% if not config or not config.tls_enabled %}disabled{% endif %} {% if config and config.tls_enabled and not config.client_key %}required{% endif %} />
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card mb-4">
+                    <div class="card-header"><strong>Instance Defaults</strong></div>
+                    <div class="card-body">
+                        <div class="form-row">
+                            <div class="form-group col-md-4">
+                                <label for="revert-cooldown">Revert Cooldown</label>
+                                <input class="form-control" type="number" min="0" step="1" id="revert-cooldown" name="revert_cooldown" value="{{ config.revert_cooldown if config and config.revert_cooldown is not none else 300 }}" />
+                                <small class="form-text text-muted">Seconds a player must wait before resetting the same challenge instance.</small>
+                            </div>
+                            <div class="form-group col-md-4">
+                                <label for="container-ttl">Instance TTL</label>
+                                <input class="form-control" type="number" min="60" step="1" id="container-ttl" name="container_ttl" value="{{ config.container_ttl if config and config.container_ttl is not none else 7200 }}" />
+                                <small class="form-text text-muted">Seconds before the reaper automatically stops idle or forgotten instances.</small>
+                            </div>
+                            <div class="form-group col-md-4">
+                                <label for="max-active">Max Active Challenges</label>
+                                <input class="form-control" type="number" min="0" step="1" id="max-active" name="max_active" value="{{ config.max_active if config and config.max_active is not none else 0 }}" />
+                                <small class="form-text text-muted"><code>0</code> means unlimited active challenge instances per participant.</small>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card mb-4">
+                    <div class="card-header"><strong>Allowed Repositories</strong></div>
+                    <div class="card-body">
+                        <p class="text-muted">Only the selected repositories will be available to challenge authors.</p>
+                        <select id="repositories" name="repositories" class="form-control" size="10" multiple>
+                            {% if form.repositories.choices[0][0] == "ERROR" %}
+                            <option value="False" disabled>{{ form.repositories.choices[0][1] }}</option>
+                            {% elif form.repositories %}
+                            {% for key, value in form.repositories.choices %}
+                            <option value="{{ key }}" {% if key in repos %}selected{% endif %}>{{ value }}</option>
+                            {% endfor %}
+                            {% else %}
+                            <option value="False" disabled>Connect Docker API First</option>
+                            {% endif %}
+                        </select>
+                    </div>
+                </div>
+
+                {{ form.nonce() }}
+                <div class="text-center">
+                    <button type="submit" tabindex="0" class="btn btn-md btn-primary btn-outlined">Save Docker Settings</button>
+                </div>
+                <input type="hidden" name="id" value="1">
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock content %}
+{% block scripts %}
+<script>
+function enable_file_form(status) {
+    status = !status;
+    const form = document.forms.docker_config;
+    if (!form) {
+        return;
+    }
+    ["ca_cert", "client_cert", "client_key"].forEach(function (fieldName) {
+        const field = form.elements[fieldName];
+        if (!field) {
+            return;
+        }
+        field.disabled = status;
+        field.required = !status;
+    });
+}
+</script>
+{% endblock scripts %}
