@@ -147,7 +147,7 @@ DOCKER_CHALLENGE_PUBLIC_HOST=ctf.example.com
 
 ### Size Docker Networks for Compose Challenges
 
-Each compose stack gets its own Docker bridge network. For events with many concurrent compose instances, increase Docker’s default address pools on the host:
+Each running Compose stack uses one bridge network. For **X** concurrent teams, choose a nonoverlapping pool with more than X subnets to leave room for other Docker networks. A base prefix `/B` split with `size: 24` provides up to `2^(24-B)` networks; the example below provides up to 4,096 `/24` networks and supported our 70-team test.
 
 ```json
 {
@@ -157,7 +157,7 @@ Each compose stack gets its own Docker bridge network. For events with many conc
 }
 ```
 
-After updating `/etc/docker/daemon.json`, restart Docker.
+Add this to `/etc/docker/daemon.json` and restart Docker during maintenance.
 
 ### Pre-Pull Challenge Images
 

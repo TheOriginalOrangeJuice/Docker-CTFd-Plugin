@@ -62,11 +62,18 @@ function createPortRows(item) {
     const lines = [];
 
     services.forEach(service => {
-        const servicePorts = service.ports || [];
-        if (servicePorts.length === 0) {
+        const mappings = service.port_mappings || [];
+        if (mappings.length) {
+            mappings.forEach(mapping => {
+                const serviceName = CTFd.lib.$("<div>").text(service.service_name).html();
+                lines.push(
+                    `<strong>${serviceName} ${mapping.target}/${mapping.protocol}</strong>: ` +
+                    `${item.host}:${mapping.published}`
+                );
+            });
             return;
         }
-
+        const servicePorts = service.ports || [];
         servicePorts.forEach(port => {
             const cleanPort = String(port).split("/")[0];
             if (item.is_compose) {
@@ -93,6 +100,11 @@ function renderConnectionInfo(item) {
         }
 
         let html = $element.data("dockerTemplate");
+        const mappings = (item.services || []).flatMap(service => service.port_mappings || []);
+        html = html.replace(/\{\{PORT_(\d+)\}\}/g, (match, target) => {
+            const mapping = mappings.find(entry => String(entry.target) === target);
+            return mapping ? String(mapping.published) : match;
+        });
         if (html.includes("{{HOST}}") || html.includes("{{PORT}}")) {
             html = html.replace(/\{\{HOST\}\}/g, item.host || "");
             html = html.replace(/\{\{PORT\}\}/g, firstPort || "");

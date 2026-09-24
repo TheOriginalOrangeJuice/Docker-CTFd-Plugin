@@ -76,6 +76,7 @@ class DockerChallengeTracker(db.Model):
     stack_id = db.Column('stack_id', db.String(64), nullable=True, index=True)
     network_id = db.Column('network_id', db.String(128), nullable=True)
     ports_json = db.Column('ports_json', db.Text, nullable=True)
+    port_mappings_json = db.Column('port_mappings_json', db.Text, nullable=True)
     instance_key = db.Column('instance_key', db.String(160), nullable=True, index=True)
 
 
@@ -211,6 +212,7 @@ COMPOSE_ALLOWED_KEYS = {
     'cap_drop',
     'read_only',
     'pids_limit',
+    'shm_size',
 }
 MAX_COMPOSE_BYTES = 128 * 1024
 MAX_YAML_ALIASES = 64
@@ -665,7 +667,9 @@ def compare_and_set_instance_state(record, state, error=None, commit=True):
 
 def ensure_legacy_instance_record(participant, challenge, trackers):
     """Create the lifecycle row for tracker data written by older versions."""
-    record = get_instance_record(participant, challenge, for_update=True)
+    # The caller already holds the owner row lock. Avoid SELECT FOR UPDATE on
+    # a missing instance: InnoDB gap locks deadlock distinct owners during bursts.
+    record = get_instance_record(participant, challenge)
     if record is not None or not trackers:
         return record
     now = unix_time(datetime.utcnow())
@@ -717,6 +721,14 @@ def decode_ports(tracker):
     if tracker.ports:
         return [port for port in tracker.ports.split(",") if port]
     return []
+
+
+def decode_port_mappings(tracker):
+    try:
+        mappings = json.loads(tracker.port_mappings_json or '[]')
+        return mappings if isinstance(mappings, list) else []
+    except (TypeError, ValueError):
+        return []
 
 
 def get_runtime_owner_data(participant):
@@ -887,6 +899,38 @@ def cleanup_all_expired_trackers(docker):
         delete_trackers(docker, expired, reason="expire", actor_role="system")
 
 
+def cleanup_solved_trackers(docker):
+    """Reap solved instances outside the flag submission request."""
+    if not docker:
+        return
+    trackers = DockerChallengeTracker.query.filter(
+        DockerChallengeTracker.challenge_id.isnot(None)
+    ).all()
+    if not trackers:
+        return
+    challenge_ids = {tracker.challenge_id for tracker in trackers}
+    solved_refs = set()
+    for challenge_id, team_id, user_id in db.session.query(
+        Solves.challenge_id, Solves.team_id, Solves.user_id
+    ).filter(Solves.challenge_id.in_(challenge_ids)).all():
+        if team_id is not None:
+            solved_refs.add(("teams", str(team_id), challenge_id))
+        if user_id is not None:
+            solved_refs.add(("users", str(user_id), challenge_id))
+    by_ref = {}
+    for tracker in trackers:
+        if tracker.team_id:
+            ref = ("teams", str(tracker.team_id), tracker.challenge_id)
+        elif tracker.user_id:
+            ref = ("users", str(tracker.user_id), tracker.challenge_id)
+        else:
+            continue
+        if ref in solved_refs:
+            by_ref.setdefault(ref, []).append(tracker)
+    for entries in by_ref.values():
+        delete_trackers(docker, entries, reason="solve_cleanup", actor_role="system")
+
+
 def get_docker_config():
     return DockerConfig.query.filter_by(id=1).first() or DockerConfig.query.first()
 
@@ -911,6 +955,7 @@ def run_reaper_cycle():
         return False
 
     try:
+        cleanup_solved_trackers(docker)
         cleanup_all_expired_trackers(docker)
         reconcile_docker_resources(docker)
         DockerConfig.query.filter_by(id=docker.id).update(
@@ -1407,6 +1452,8 @@ def build_resource_host_config(service=None):
             host_config['ReadonlyRootfs'] = True
         if service.get('pids_limit') is not None:
             host_config['PidsLimit'] = int(service['pids_limit'])
+        if service.get('shm_size') is not None:
+            host_config['ShmSize'] = int(service['shm_size'])
 
     return host_config
 
@@ -1937,6 +1984,9 @@ def parse_compose_content(yaml_str):
         cpu_limit = parse_cpu_value(svc.get('cpus'))
         if cpu_limit is not None and cpu_limit > MAX_SERVICE_CPUS:
             raise ValueError(f"Service '{name}' CPU limit exceeds {MAX_SERVICE_CPUS:g} CPUs")
+        shm_size = parse_memory_value(svc.get('shm_size'))
+        if shm_size is not None and shm_size > MAX_SERVICE_MEMORY_BYTES:
+            raise ValueError(f"Service '{name}' shared memory size exceeds 16 GiB")
         pids_limit = parse_optional_int(svc.get('pids_limit'))
         if pids_limit is not None and not (1 <= pids_limit <= MAX_SERVICE_PIDS):
             raise ValueError(f"Service '{name}' pids_limit must be between 1 and {MAX_SERVICE_PIDS}")
@@ -1956,6 +2006,7 @@ def parse_compose_content(yaml_str):
             'cap_drop': cap_drop,
             'read_only': bool(parse_optional_bool(svc.get('read_only'))),
             'pids_limit': pids_limit,
+            'shm_size': shm_size,
         }
 
     if total_published_ports > get_max_published_ports():
@@ -2092,12 +2143,18 @@ def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl,
                 exposed_ports = {}
                 port_bindings = {}
                 assigned_host_ports = []
+                port_mappings = []
                 for p in svc['ports']:
                     key = f"{p['target']}/{p['protocol']}"
                     exposed_ports[key] = {}
                     host_port = port_map[svc_name][(p['target'], p['protocol'])]
                     port_bindings[key] = [{'HostPort': str(host_port)}]
                     assigned_host_ports.append(f"{host_port}/{p['protocol']}")
+                    port_mappings.append({
+                        'target': p['target'],
+                        'published': host_port,
+                        'protocol': p['protocol'],
+                    })
 
                 config = {
                     'Image': svc['image'],
@@ -2159,6 +2216,7 @@ def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl,
                     'instance_id': container_id,
                     'image': svc['image'],
                     'ports': ','.join(assigned_host_ports) if assigned_host_ports else '',
+                    'port_mappings': port_mappings,
                 })
 
             return {
@@ -2720,22 +2778,8 @@ class DockerChallengeType(BaseChallenge):
 		"""
         data = request.form or request.get_json()
         submission = data["submission"].strip()
-        docker = get_docker_config()
-        try:
-            participant = team if is_teams_mode() else user
-            docker_containers = get_trackers_for_challenge(participant, challenge)
-            if docker_containers:
-                delete_trackers(
-                    docker,
-                    docker_containers,
-                    reason="solve_cleanup",
-                    participant=participant,
-                    actor_role="participant",
-                    actor_id=participant.id,
-                    actor_name=get_participant_name(participant),
-                )
-        except Exception:
-            traceback.print_exc()
+        # Commit the score before Docker cleanup. The reaper finds this solve and
+        # removes the stack; Docker API latency must not block flag submission.
         solve = Solves(
             user_id=user.id,
             team_id=team.id if team else None,
@@ -2745,8 +2789,6 @@ class DockerChallengeType(BaseChallenge):
         )
         db.session.add(solve)
         db.session.commit()
-        # trying if this solces the detached instance error...
-        #db.session.close()
 
     @staticmethod
     def fail(user, team, challenge, request):
@@ -3131,6 +3173,7 @@ class ContainerAPI(Resource):
                         instance_id=container['instance_id'],
                         ports=ports_string,
                         ports_json=ports_json,
+                        port_mappings_json=json.dumps(container['port_mappings']),
                         host=host,
                         challenge=challenge_label,
                         challenge_id=docker_chal.id,
@@ -3250,6 +3293,7 @@ class DockerStatus(Resource):
                         'service_name': entry.service_name or entry.docker_image,
                         'image': entry.docker_image,
                         'ports': service_ports,
+                        'port_mappings': decode_port_mappings(entry),
                     })
                 data.append({
                     'id': i.id,
@@ -3425,6 +3469,8 @@ def _ensure_columns(app):
                     conn.execute(text('ALTER TABLE docker_challenge_tracker ADD COLUMN network_id VARCHAR(128)'))
                 if 'ports_json' not in tracker_cols:
                     conn.execute(text('ALTER TABLE docker_challenge_tracker ADD COLUMN ports_json TEXT'))
+                if 'port_mappings_json' not in tracker_cols:
+                    conn.execute(text('ALTER TABLE docker_challenge_tracker ADD COLUMN port_mappings_json TEXT'))
                 if 'instance_key' not in tracker_cols:
                     conn.execute(text('ALTER TABLE docker_challenge_tracker ADD COLUMN instance_key VARCHAR(160)'))
             ensure_index('docker_challenge_tracker', 'ix_docker_challenge_tracker_challenge_id', 'challenge_id')
