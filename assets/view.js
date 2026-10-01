@@ -1,9 +1,14 @@
 CTFd._internal.challenge.data = undefined;
 CTFd._internal.challenge.renderer = CTFd._internal.markdown;
 
-let checkInterval = null;
-let revertCountdownTimer = null;
-let expiryCountdownTimer = null;
+// CTFd evaluates this script again whenever a Docker challenge is opened.
+// Clear previous timers and use redeclarable globals for its inline action handlers.
+if (typeof checkInterval !== 'undefined') clearInterval(checkInterval);
+if (typeof revertCountdownTimer !== 'undefined') clearInterval(revertCountdownTimer);
+if (typeof expiryCountdownTimer !== 'undefined') clearInterval(expiryCountdownTimer);
+var checkInterval = null;
+var revertCountdownTimer = null;
+var expiryCountdownTimer = null;
 
 CTFd._internal.challenge.preRender = function () {};
 
