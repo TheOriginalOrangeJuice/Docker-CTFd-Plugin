@@ -1,16 +1,17 @@
 import hashlib
 import hmac
 import json
+import math
 import os
 import random
 import re
 import secrets
 import shlex
-import socket
 import tempfile
 import threading
 import time
 import traceback
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,10 +34,11 @@ from CTFd.plugins import register_plugin_assets_directory
 from CTFd.plugins.challenges import BaseChallenge, CHALLENGE_CLASSES
 from CTFd.plugins.flags import get_flag_class
 from CTFd.utils.config import is_teams_mode
+from CTFd.utils.config.visibility import challenges_visible
 from CTFd.utils.dates import unix_time
 from CTFd.utils.decorators import admins_only, authed_only, during_ctf_time_only, require_verified_emails
 from CTFd.utils.uploads import delete_file
-from CTFd.utils.user import get_current_team, get_current_user, get_ip
+from CTFd.utils.user import get_current_team, get_current_user, get_ip, is_admin
 
 
 class DockerConfig(db.Model):
@@ -105,6 +107,7 @@ class DockerChallengeInstance(db.Model):
     state = db.Column(db.String(16), nullable=False, default="stopped", index=True)
     operation_token = db.Column(db.String(64), nullable=True)
     created_at = db.Column(db.Integer, nullable=False)
+    last_started_at = db.Column(db.Integer, nullable=True)
     updated_at = db.Column(db.Integer, nullable=False, index=True)
     error = db.Column(db.Text, nullable=True)
 
@@ -334,6 +337,8 @@ def parse_memory_value(value):
     if isinstance(value, bool):
         raise ValueError("Memory limits must be numeric")
     if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("Memory limits must be finite")
         parsed = int(value)
         if parsed <= 0:
             raise ValueError("Memory limits must be greater than zero")
@@ -370,14 +375,14 @@ def parse_memory_value(value):
         "pi": 1024 ** 5,
         "pib": 1024 ** 5,
     }
-    return int(amount * multipliers[unit])
+    size = amount * multipliers[unit]
+    if not math.isfinite(size) or size < 1:
+        raise ValueError("Memory limits must be finite and at least one byte")
+    return int(size)
 
 
 def get_default_memory_limit():
-    try:
-        return parse_memory_value(os.environ.get("DOCKER_CHALLENGE_MEMORY_LIMIT"))
-    except ValueError:
-        return None
+    return parse_memory_value(os.environ.get("DOCKER_CHALLENGE_MEMORY_LIMIT"))
 
 
 def parse_cpu_value(value):
@@ -389,17 +394,13 @@ def parse_cpu_value(value):
         parsed = float(value)
     except (TypeError, ValueError):
         raise ValueError(f"Invalid CPU limit '{value}'")
-    if parsed <= 0:
-        raise ValueError("CPU limits must be greater than zero")
+    if not math.isfinite(parsed) or parsed < 1e-9 or not math.isfinite(parsed * 1_000_000_000):
+        raise ValueError("CPU limits must be finite and at least one NanoCPU")
     return parsed
 
 
 def get_default_cpu_limit():
-    value = os.environ.get("DOCKER_CHALLENGE_CPU_LIMIT")
-    if value in (None, ""):
-        return None
-    parsed = get_plugin_setting_float("DOCKER_CHALLENGE_CPU_LIMIT", 0.0, minimum=0.0)
-    return parsed or None
+    return parse_cpu_value(os.environ.get("DOCKER_CHALLENGE_CPU_LIMIT"))
 
 
 def get_reaper_interval():
@@ -544,6 +545,29 @@ def get_participant_name(participant):
     return getattr(participant, "name", None) or getattr(participant, "email", None) or str(participant.id)
 
 
+def require_challenge_access(challenge, participant):
+    if is_admin():
+        return
+    if not challenges_visible() or challenge.state in {"hidden", "locked"}:
+        abort(403, "This challenge is not currently available")
+    requirements = (challenge.requirements or {}).get("prerequisites", [])
+    if requirements:
+        prerequisites = {
+            row[0] for row in db.session.query(Challenges.id).filter(
+                Challenges.id.in_(requirements)
+            ).all()
+        }
+        owner_field = Solves.team_id if is_teams_mode() else Solves.user_id
+        solved = {
+            row[0] for row in db.session.query(Solves.challenge_id).filter(
+                owner_field == participant.id,
+                Solves.challenge_id.in_(prerequisites),
+            ).all()
+        }
+        if not prerequisites.issubset(solved):
+            abort(403, "Complete this challenge's prerequisites before starting an instance")
+
+
 def get_owner_kwargs(participant):
     return {
         "team_id": str(participant.id) if is_teams_mode() else None,
@@ -586,7 +610,7 @@ def get_instance_record_by_identity(owner_mode, owner_id, challenge_id, for_upda
         challenge_id=challenge_id,
     )
     if for_update:
-        query = query.with_for_update()
+        query = query.populate_existing().with_for_update()
     return query.first()
 
 
@@ -606,11 +630,15 @@ def acquire_owner_lock_by_identity(owner_mode, owner_id):
             db.session.commit()
         except IntegrityError:
             db.session.rollback()
+    else:
+        # Discard the earlier read snapshot before waiting for the owner lock.
+        # Reservation checks must see lifecycle changes committed by its holder.
+        db.session.commit()
 
     lock_row = DockerOwnerLock.query.filter_by(
         owner_mode=owner_mode,
         owner_id=owner_id,
-    ).with_for_update().first()
+    ).populate_existing().with_for_update().first()
     if lock_row is None:
         raise RuntimeError("Unable to acquire the Docker instance owner lock")
 
@@ -670,7 +698,10 @@ def ensure_legacy_instance_record(participant, challenge, trackers):
     # The caller already holds the owner row lock. Avoid SELECT FOR UPDATE on
     # a missing instance: InnoDB gap locks deadlock distinct owners during bursts.
     record = get_instance_record(participant, challenge)
-    if record is not None or not trackers:
+    if record is not None:
+        backfill_last_started_at(record, trackers)
+        return record
+    if not trackers:
         return record
     now = unix_time(datetime.utcnow())
     record = DockerChallengeInstance(
@@ -685,10 +716,24 @@ def ensure_legacy_instance_record(participant, challenge, trackers):
         updated_at=now,
     )
     db.session.add(record)
+    backfill_last_started_at(record, trackers)
     db.session.flush()
     for tracker in trackers:
         tracker.instance_key = record.instance_key
     return record
+
+
+def backfill_last_started_at(record, trackers):
+    if record.last_started_at is not None:
+        return
+    timestamps = []
+    for tracker in trackers:
+        try:
+            timestamps.append(int(tracker.timestamp))
+        except (TypeError, ValueError):
+            continue
+    if timestamps:
+        record.last_started_at = max(timestamps)
 
 
 def get_record_from_tracker(tracker):
@@ -936,29 +981,32 @@ def get_docker_config():
 
 
 def run_reaper_cycle():
-    docker = get_docker_config()
-    if not docker:
-        return False
-
-    now = unix_time(datetime.utcnow())
-    lock_until = docker.reaper_lock_until or 0
-    if lock_until and lock_until > now:
-        return False
-
-    lease_seconds = max(get_reaper_interval() * 10, 900)
-    updated = DockerConfig.query.filter(
-        DockerConfig.id == docker.id,
-        (DockerConfig.reaper_lock_until.is_(None)) | (DockerConfig.reaper_lock_until < now),
-    ).update({"reaper_lock_until": now + lease_seconds}, synchronize_session=False)
-    db.session.commit()
-    if updated != 1:
-        return False
-
+    config_id = None
+    lease_until = None
+    lease_acquired = False
     try:
+        docker = get_docker_config()
+        if not docker:
+            return False
+        now = unix_time(datetime.utcnow())
+        if (docker.reaper_lock_until or 0) > now:
+            return False
+
+        config_id = docker.id
+        lease_until = now + max(get_reaper_interval() * 10, 900)
+        updated = DockerConfig.query.filter(
+            DockerConfig.id == config_id,
+            (DockerConfig.reaper_lock_until.is_(None)) | (DockerConfig.reaper_lock_until <= now),
+        ).update({"reaper_lock_until": lease_until}, synchronize_session=False)
+        db.session.commit()
+        if updated != 1:
+            return False
+        lease_acquired = True
+
         cleanup_solved_trackers(docker)
         cleanup_all_expired_trackers(docker)
         reconcile_docker_resources(docker)
-        DockerConfig.query.filter_by(id=docker.id).update(
+        DockerConfig.query.filter_by(id=config_id, reaper_lock_until=lease_until).update(
             {
                 "reaper_last_run": now,
                 "reaper_lock_until": now - 1,
@@ -968,21 +1016,30 @@ def run_reaper_cycle():
         db.session.commit()
         return True
     except Exception:
-        traceback.print_exc()
-        db.session.rollback()
-        DockerConfig.query.filter_by(id=docker.id).update(
-            {"reaper_lock_until": now - 1},
-            synchronize_session=False,
-        )
-        db.session.commit()
+        current_app.logger.exception("Docker cleanup cycle failed")
+        try:
+            db.session.rollback()
+            if lease_acquired:
+                DockerConfig.query.filter_by(id=config_id, reaper_lock_until=lease_until).update(
+                    {"reaper_lock_until": unix_time(datetime.utcnow()) - 1},
+                    synchronize_session=False,
+                )
+                db.session.commit()
+        except Exception:
+            current_app.logger.exception("Unable to release the Docker cleanup lease")
+        finally:
+            db.session.remove()
         return False
 
 
 def _reaper_loop(app):
     while True:
         time.sleep(get_reaper_interval())
-        with app.app_context():
-            run_reaper_cycle()
+        try:
+            with app.app_context():
+                run_reaper_cycle()
+        except Exception:
+            app.logger.exception("Docker cleanup thread will retry on the next interval")
 
 
 def start_reaper_thread(app):
@@ -1276,7 +1333,9 @@ def get_repositories(docker, tags=False, repos=None):
 
 def get_unavailable_ports(docker):
     response = do_request(docker, '/containers/json?all=1')
-    containers = parse_response_json(response, default=[]) or []
+    containers = parse_response_json(response)
+    if response is None or response.status_code >= 400 or not isinstance(containers, list):
+        raise RuntimeError("Cannot inspect Docker port allocations")
     result = []
     for container in containers:
         for port in container.get('Ports') or []:
@@ -1286,15 +1345,27 @@ def get_unavailable_ports(docker):
     return result
 
 
-def get_required_ports(docker, image):
+def refresh_unavailable_ports(docker, used_ports):
+    # Keep ports tried by this launch while incorporating new worker allocations.
+    used_ports[:] = sorted(set(used_ports) | set(get_unavailable_ports(docker)))
+
+
+def inspect_challenge_image(docker, image):
     response = do_request(docker, f"/images/{quote(image, safe='')}/json")
     if response is None:
         raise RuntimeError(f"Failed to inspect image '{image}'")
     if response.status_code >= 400:
         raise RuntimeError(f"Image '{image}' could not be inspected: {response.text}")
 
-    exposed = (parse_response_json(response, default={}) or {}).get('Config', {}).get('ExposedPorts', {})
-    return sorted(exposed.keys()) if exposed else []
+    details = parse_response_json(response)
+    if not isinstance(details, dict) or not isinstance(details.get('Id'), str) or not details['Id']:
+        raise RuntimeError(f"Docker returned invalid metadata for image '{image}'")
+    return details
+
+
+def get_required_ports(docker, image):
+    details = inspect_challenge_image(docker, image)
+    return sorted((details.get('Config') or {}).get('ExposedPorts') or {})
 
 
 def normalize_published_ports(value):
@@ -1336,22 +1407,7 @@ def decode_published_ports(challenge):
     raw = getattr(challenge, 'published_ports', None)
     if raw in (None, ''):
         return None
-    try:
-        return normalize_published_ports(raw)
-    except ValueError:
-        return None
-
-
-def is_host_port_available(port, protocol='tcp'):
-    socket_type = socket.SOCK_DGRAM if str(protocol).lower() == 'udp' else socket.SOCK_STREAM
-    test_socket = socket.socket(socket.AF_INET, socket_type)
-    try:
-        test_socket.bind(("0.0.0.0", int(port)))
-        return True
-    except OSError:
-        return False
-    finally:
-        test_socket.close()
+    return normalize_published_ports(raw)
 
 
 def is_port_conflict_error(message):
@@ -1371,16 +1427,11 @@ def pick_available_host_port(used_ports, protocol='tcp'):
     port_min, port_max = get_port_bounds()
     used = {int(port) for port in used_ports}
     candidates = [port for port in range(port_min, port_max + 1) if port not in used]
-    random.shuffle(candidates)
-    for selected in candidates:
-        if not is_host_port_available(selected, protocol=protocol):
-            used_ports.append(selected)
-            continue
-        used_ports.append(selected)
-        return selected
     if not candidates:
         raise RuntimeError("No free Docker challenge ports are available in the configured range")
-    raise RuntimeError("No bindable Docker challenge ports are available in the configured range")
+    selected = random.choice(candidates)
+    used_ports.append(selected)
+    return selected
 
 
 def sanitize_container_name(value, max_length=64):
@@ -1398,6 +1449,11 @@ def build_container_name(image, owner_identity, challenge_id):
 def build_stack_name(owner_identity, challenge_id):
     owner_hash = hashlib.sha256(str(owner_identity).encode("utf-8")).hexdigest()[:12]
     return sanitize_container_name(f"ctfd_s{challenge_id}_{owner_hash}")
+
+
+def build_instance_network_name(labels):
+    identity = f"{get_resource_instance_key(labels)}:{labels['ctfd.operation.token']}"
+    return 'ctfd_n_' + hashlib.sha256(identity.encode('utf-8')).hexdigest()[:32]
 
 
 def build_service_container_name(stack_id, service_name):
@@ -1472,6 +1528,58 @@ def inspect_named_network(docker, network_name):
     return do_request(docker, f"/networks/{quote(network_name, safe='')}")
 
 
+def resource_labels_match(actual, expected):
+    """Match instance ownership, including an operation token when supplied."""
+    if not isinstance(actual, Mapping) or not isinstance(expected, Mapping):
+        return False
+    if actual.get('ctfd.plugin') != PLUGIN_LABEL or expected.get('ctfd.plugin') != PLUGIN_LABEL:
+        return False
+    instance_key = get_resource_instance_key(expected)
+    legacy_owner = (expected.get('ctfd.stack.id') and expected.get('ctfd.owner.id')
+                    and expected.get('ctfd.owner.mode') in {'users', 'teams'})
+    if not instance_key and not legacy_owner:
+        return False
+    if instance_key and get_resource_instance_key(actual) != instance_key:
+        return False
+    return all(not expected.get(key) or actual.get(key) == expected[key] for key in (
+        'ctfd.challenge.id', 'ctfd.owner.id', 'ctfd.owner.mode',
+        'ctfd.stack.id', 'ctfd.operation.token',
+    ))
+
+
+def tracker_network_labels(tracker):
+    labels = {'ctfd.plugin': PLUGIN_LABEL}
+    if tracker.team_id or tracker.user_id:
+        labels['ctfd.owner.mode'] = 'teams' if tracker.team_id else 'users'
+        labels['ctfd.owner.id'] = str(tracker.team_id or tracker.user_id)
+    if tracker.challenge_id is not None:
+        labels['ctfd.challenge.id'] = str(tracker.challenge_id)
+    if tracker.instance_key:
+        labels['ctfd.instance.key'] = tracker.instance_key
+    if tracker.stack_id:
+        labels['ctfd.stack.id'] = tracker.stack_id
+    return labels
+
+
+def create_instance_network(docker, labels):
+    name = build_instance_network_name(labels)
+    payload = {'Name': name, 'Driver': 'bridge', 'CheckDuplicate': True, 'Labels': labels}
+    try:
+        response = do_request_with_body(docker, '/networks/create', data=payload)
+        if response is not None and response.status_code == 409 and cleanup_conflicting_network(docker, name, labels):
+            response = do_request_with_body(docker, '/networks/create', data=payload)
+        if response is None or response.status_code >= 400:
+            raise RuntimeError(f"Failed to create instance network: {response.text if response is not None else 'no response'}")
+        details = parse_response_json(response)
+        if not isinstance(details, dict) or not details.get('Id'):
+            raise RuntimeError("Docker did not return an instance network id")
+        return details['Id']
+    except Exception:
+        # Docker may have created the network before its reply was lost.
+        cleanup_created_resources(docker, container_result={'network_id': name, 'network_labels': labels})
+        raise
+
+
 def cleanup_conflicting_container(docker, container_name, expected_labels):
     inspect_response = inspect_named_container(docker, container_name)
     if inspect_response is None or inspect_response.status_code >= 400:
@@ -1479,11 +1587,8 @@ def cleanup_conflicting_container(docker, container_name, expected_labels):
 
     details = parse_response_json(inspect_response, default={}) or {}
     labels = details.get("Config", {}).get("Labels", {}) or {}
-    if labels.get("ctfd.plugin") != PLUGIN_LABEL:
+    if not resource_labels_match(labels, expected_labels):
         return False
-    for key in ("ctfd.challenge.id", "ctfd.owner.id", "ctfd.owner.mode"):
-        if expected_labels.get(key) and labels.get(key) != expected_labels.get(key):
-            return False
     return delete_container(docker, details.get("Id") or container_name)
 
 
@@ -1493,12 +1598,12 @@ def cleanup_conflicting_network(docker, network_name, expected_labels):
         return False
 
     details = parse_response_json(inspect_response, default={}) or {}
-    labels = details.get("Labels", {}) or {}
-    if labels.get("ctfd.plugin") != PLUGIN_LABEL:
+    if (not isinstance(details, dict) or details.get('Name') in {'bridge', 'host', 'none'}
+            or details.get('Driver') != 'bridge'):
         return False
-    for key in ("ctfd.challenge.id", "ctfd.owner.id", "ctfd.owner.mode", "ctfd.stack.id"):
-        if expected_labels.get(key) and labels.get(key) != expected_labels.get(key):
-            return False
+    labels = details.get("Labels", {}) or {}
+    if not resource_labels_match(labels, expected_labels):
+        return False
 
     for container_id in (details.get("Containers") or {}).keys():
         if not container_id:
@@ -1508,15 +1613,14 @@ def cleanup_conflicting_network(docker, network_name, expected_labels):
             return False
         container_details = parse_response_json(container_response, default={}) or {}
         container_labels = container_details.get("Config", {}).get("Labels", {}) or {}
-        if container_labels.get("ctfd.plugin") != PLUGIN_LABEL:
-            return False
-        if container_labels.get("ctfd.stack.id") != expected_labels.get("ctfd.stack.id"):
+        if not resource_labels_match(container_labels, expected_labels):
             return False
 
     for container_id in (details.get("Containers") or {}).keys():
-        delete_container(docker, container_id)
+        if not delete_container(docker, container_id):
+            return False
     network_id = details.get("Id") or network_name
-    return delete_network(docker, network_id)
+    return delete_network(docker, network_id, expected_labels)
 
 
 def create_container(docker, image, owner_identity, challenge_id, portbl, labels=None, env_vars=None, selected_ports=None):
@@ -1527,20 +1631,48 @@ def create_container(docker, image, owner_identity, challenge_id, portbl, labels
     if not image_is_allowed(image, allowed_repositories):
         raise ValueError(f"Image '{image}' is not in the configured repository allow-list")
 
-    available_ports = get_required_ports(docker, image)
+    resources = build_resource_host_config()
+    image_details = inspect_challenge_image(docker, image)
+    available_ports = normalize_published_ports(sorted((image_details.get('Config') or {}).get('ExposedPorts') or {}))
     needed_ports = normalize_published_ports(selected_ports) if selected_ports is not None else available_ports
     if not needed_ports:
         raise ValueError(f"No published ports are configured for image '{image}'")
+    if len(needed_ports) > get_max_published_ports():
+        raise ValueError(f"A challenge may publish at most {get_max_published_ports()} ports")
     unavailable = sorted(set(needed_ports) - set(available_ports))
     if unavailable:
         raise ValueError(
             f"Image '{image}' does not expose the selected port(s): {', '.join(unavailable)}"
         )
 
+    network_labels = {
+        'ctfd.plugin': PLUGIN_LABEL,
+        'ctfd.challenge.id': str(challenge_id),
+        'ctfd.instance.key': str(owner_identity),
+        **(labels or {}),
+    }
+    network_labels.setdefault('ctfd.operation.token', secrets.token_hex(16))
+    network_id = create_instance_network(docker, network_labels)
+    try:
+        return create_container_on_network(
+            docker, image, owner_identity, challenge_id, portbl,
+            network_id, needed_ports, network_labels, env_vars, image_details['Id'], resources,
+        )
+    except Exception:
+        cleanup_created_resources(docker, container_result={
+            'network_id': network_id, 'network_labels': network_labels,
+        })
+        raise
+
+
+def create_container_on_network(docker, image, owner_identity, challenge_id, portbl,
+                                network_id, needed_ports, labels, env_vars, image_id, resources):
     container_name = build_container_name(image, owner_identity, challenge_id)
     retry_limit = get_port_retry_limit()
     last_error = None
     for attempt in range(retry_limit):
+        if attempt:
+            refresh_unavailable_ports(docker, portbl)
         exposed_ports = {}
         port_bindings = {}
         assigned_host_ports = []
@@ -1552,11 +1684,12 @@ def create_container(docker, image, owner_identity, challenge_id, portbl, labels
             assigned_host_ports.append(f"{host_port}/{protocol}")
 
         host_config = {
+            'NetworkMode': network_id,
             'PortBindings': port_bindings,
-            **build_resource_host_config(),
+            **resources,
         }
         payload = {
-            "Image": image,
+            "Image": image_id,
             "ExposedPorts": exposed_ports,
             "HostConfig": host_config,
             "Labels": labels or {},
@@ -1590,17 +1723,22 @@ def create_container(docker, image, owner_identity, challenge_id, portbl, labels
         if not container_id:
             raise RuntimeError(f"Docker did not return a container id for '{image}'")
 
-        start_response = do_request_with_body(docker, f"/containers/{container_id}/start", method='POST')
-        if start_response is None or (start_response.status_code >= 400 and start_response.status_code != 304):
-            delete_container(docker, container_id)
-            error_text = start_response.text if start_response is not None else "no response"
-            last_error = RuntimeError(f"Failed to start container '{container_id}': {error_text}")
-            if not is_port_conflict_error(error_text) or attempt == retry_limit - 1:
-                raise last_error
+        try:
+            start_response = do_request_with_body(docker, f"/containers/{container_id}/start", method='POST')
+            if start_response is None or (start_response.status_code >= 400 and start_response.status_code != 304):
+                error_text = start_response.text if start_response is not None else "no response"
+                raise RuntimeError(f"Failed to start container '{container_id}': {error_text}")
+        except Exception as exc:
+            last_error = exc
+            cleaned = cleanup_created_resources(docker, container_result={'Id': container_id})
+            if not cleaned or not is_port_conflict_error(exc) or attempt == retry_limit - 1:
+                raise
             continue
 
         return {
             'Id': container_id,
+            'network_id': network_id,
+            'network_labels': labels,
             'ports': assigned_host_ports,
             'config': payload,
         }
@@ -1610,14 +1748,28 @@ def create_container(docker, image, owner_identity, challenge_id, portbl, labels
 
 def delete_container(docker, instance_id):
     headers = {'Content-Type': "application/json"}
-    response = do_request(docker, f'/containers/{instance_id}?force=true', headers=headers, method='DELETE')
+    response = do_request(docker, f'/containers/{instance_id}?force=true&v=true', headers=headers, method='DELETE')
     if response is None:
         return False
     return response.status_code == 404 or response.status_code < 400
 
 
-def delete_network(docker, network_id):
-    response = do_request(docker, f'/networks/{network_id}', method='DELETE')
+def delete_network(docker, network_id, expected_labels):
+    if network_id in {'bridge', 'host', 'none'}:
+        return False
+    inspected = inspect_named_network(docker, network_id)
+    if inspected is None:
+        return False
+    if inspected.status_code == 404:
+        return True
+    if inspected.status_code >= 400:
+        return False
+    details = parse_response_json(inspected)
+    if (not isinstance(details, dict) or details.get('Name') in {'bridge', 'host', 'none'}
+            or details.get('Driver') != 'bridge' or details.get('Containers')
+            or not resource_labels_match(details.get('Labels'), expected_labels)):
+        return False
+    response = do_request(docker, f"/networks/{quote(details.get('Id') or network_id, safe='')}", method='DELETE')
     if response is None:
         return False
     return response.status_code == 404 or response.status_code < 400
@@ -1717,6 +1869,8 @@ def reconcile_docker_resources(docker):
             owner_id=tracker.team_id or tracker.user_id,
             challenge_id=tracker.challenge_id,
         ))
+        if tracker.network_id and not delete_network(docker, tracker.network_id, tracker_network_labels(tracker)):
+            continue
         db.session.delete(tracker)
         audit_messages.append(("reconcile_missing", f"Removed stale tracker for missing container {instance_id}"))
 
@@ -1738,7 +1892,12 @@ def reconcile_docker_resources(docker):
             continue
         if tracker is None and protected_creation:
             continue
+        if tracker is not None and instance_key:
+            failed_keys.add(instance_key)
         if delete_container(docker, instance_id):
+            if tracker is not None and tracker.network_id:
+                if not delete_network(docker, tracker.network_id, tracker_network_labels(tracker)):
+                    continue
             if tracker is not None:
                 db.session.delete(tracker)
             if tracker is not None and instance_key:
@@ -1766,13 +1925,13 @@ def reconcile_docker_resources(docker):
         )
         if protected_creation:
             continue
-        if delete_network(docker, network_id):
+        if delete_network(docker, network_id, labels):
             audit_messages.append(("reconcile_orphan", f"Removed Docker network {network_id}"))
 
     for instance_key, record in records.items():
         tracker_count = DockerChallengeTracker.query.filter_by(instance_key=instance_key).count()
         age = now - int(record.updated_at or 0)
-        if instance_key in failed_keys or (record.state == INSTANCE_RUNNING and tracker_count == 0):
+        if (instance_key in failed_keys and record.state != INSTANCE_FAILED) or (record.state == INSTANCE_RUNNING and tracker_count == 0):
             compare_and_set_instance_state(
                 record,
                 INSTANCE_FAILED,
@@ -2060,13 +2219,19 @@ def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl,
                 f"Service '{service_name}' uses image '{service['image']}' which is not in the configured repository allow-list"
             )
 
+    resources = {name: build_resource_host_config(service) for name, service in services.items()}
+    image_ids = {name: inspect_challenge_image(docker, service['image'])['Id']
+                 for name, service in services.items()}
     stack_id = build_stack_name(owner_identity, challenge_id)
     host_value = get_connection_host_value(docker)
     network_labels = {
         'ctfd.plugin': PLUGIN_LABEL,
+        'ctfd.challenge.id': str(challenge_id),
+        'ctfd.instance.key': str(owner_identity),
         'ctfd.stack.id': stack_id,
         **(labels or {}),
     }
+    network_labels.setdefault('ctfd.operation.token', secrets.token_hex(16))
     order = _topo_sort_services(services)
     last_error = None
     retry_limit = get_port_retry_limit()
@@ -2075,20 +2240,9 @@ def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl,
         network_id = ""
         created = []
         try:
-            net_resp = do_request_with_body(docker, '/networks/create', data={
-                'Name': stack_id,
-                'Driver': 'bridge',
-                'Labels': network_labels,
-            })
-            if net_resp is not None and net_resp.status_code == 409 and cleanup_conflicting_network(docker, stack_id, network_labels):
-                net_resp = do_request_with_body(docker, '/networks/create', data={
-                    'Name': stack_id,
-                    'Driver': 'bridge',
-                    'Labels': network_labels,
-                })
-            if net_resp is None or net_resp.status_code >= 400:
-                raise RuntimeError(f"Failed to create network: {net_resp.text if net_resp else 'no response'}")
-            network_id = net_resp.json().get('Id', '')
+            if attempt:
+                refresh_unavailable_ports(docker, portbl)
+            network_id = create_instance_network(docker, network_labels)
 
             port_map = {}
             placeholder_port_map = {}
@@ -2157,26 +2311,23 @@ def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl,
                     })
 
                 config = {
-                    'Image': svc['image'],
+                    'Image': image_ids[svc_name],
                     'Env': env_list,
                     'HostConfig': {
-                        'NetworkMode': stack_id,
+                        'NetworkMode': network_id,
                         'PortBindings': port_bindings if port_bindings else None,
-                        **build_resource_host_config(svc),
+                        **resources[svc_name],
                     },
                     'NetworkingConfig': {
                         'EndpointsConfig': {
-                            stack_id: {
+                            network_id: {
                                 'Aliases': [svc_name],
                             }
                         }
                     },
                     'Labels': {
-                        'ctfd.plugin': PLUGIN_LABEL,
-                        'ctfd.challenge.id': str(challenge_id),
-                        'ctfd.stack.id': stack_id,
+                        **network_labels,
                         'ctfd.service.name': svc_name,
-                        **(labels or {}),
                     },
                 }
 
@@ -2205,12 +2356,6 @@ def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl,
                     raise RuntimeError(f"Failed to create container '{svc_name}': {error_text}")
 
                 container_id = resp.json()['Id']
-                start_resp = do_request_with_body(docker, f'/containers/{container_id}/start')
-                if start_resp is None or (start_resp.status_code >= 400 and start_resp.status_code != 304):
-                    error_text = start_resp.text if start_resp is not None else 'no response'
-                    delete_container(docker, container_id)
-                    raise RuntimeError(f"Failed to start container '{svc_name}': {error_text}")
-
                 created.append({
                     'service_name': svc_name,
                     'instance_id': container_id,
@@ -2218,25 +2363,23 @@ def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl,
                     'ports': ','.join(assigned_host_ports) if assigned_host_ports else '',
                     'port_mappings': port_mappings,
                 })
+                start_resp = do_request_with_body(docker, f'/containers/{container_id}/start')
+                if start_resp is None or (start_resp.status_code >= 400 and start_resp.status_code != 304):
+                    error_text = start_resp.text if start_resp is not None else 'no response'
+                    raise RuntimeError(f"Failed to start container '{svc_name}': {error_text}")
 
             return {
                 'stack_id': stack_id,
                 'network_id': network_id,
+                'network_labels': network_labels,
                 'containers': created,
             }
         except Exception as exc:
             last_error = exc
-            for container in created:
-                try:
-                    delete_container(docker, container['instance_id'])
-                except Exception:
-                    pass
-            if network_id:
-                try:
-                    delete_network(docker, network_id)
-                except Exception:
-                    pass
-            if not is_port_conflict_error(exc) or attempt == retry_limit - 1:
+            cleaned = cleanup_created_resources(docker, stack_result={
+                'containers': created, 'network_id': network_id, 'network_labels': network_labels,
+            })
+            if not cleaned or not is_port_conflict_error(exc) or attempt == retry_limit - 1:
                 raise
 
     raise last_error or RuntimeError("Failed to create compose stack")
@@ -2245,20 +2388,18 @@ def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl,
 def delete_stack(docker, stack_id, entries=None):
     """Delete all containers and network for a compose stack, and clean up DB."""
     entries = list(entries) if entries is not None else DockerChallengeTracker.query.filter_by(stack_id=stack_id).all()
-    network_id = None
     success = True
     for entry in entries:
-        if entry.network_id:
-            network_id = entry.network_id
         try:
             if not delete_container(docker, entry.instance_id):
                 success = False
         except:
             traceback.print_exc()
             success = False
-    if network_id:
+    networks = {entry.network_id: tracker_network_labels(entry) for entry in entries if entry.network_id}
+    for network_id, labels in networks.items():
         try:
-            if not delete_network(docker, network_id):
+            if not delete_network(docker, network_id, labels):
                 success = False
         except:
             traceback.print_exc()
@@ -2275,7 +2416,18 @@ def delete_stack(docker, stack_id, entries=None):
     return success
 
 
-def delete_trackers(docker, trackers, reason="stop", participant=None, actor_role="participant", actor_id=None, actor_name=None):
+def snapshot_trackers(trackers):
+    fields = (
+        'id', 'team_id', 'user_id', 'docker_image', 'timestamp', 'revert_time',
+        'instance_id', 'ports', 'host', 'challenge', 'challenge_id',
+        'service_name', 'stack_id', 'network_id', 'ports_json', 'instance_key',
+    )
+    return [SimpleNamespace(**{field: getattr(tracker, field, None) for field in fields})
+            for tracker in trackers]
+
+
+def delete_trackers(docker, trackers, reason="stop", participant=None, actor_role="participant", actor_id=None, actor_name=None,
+                    expected_operation_token=None):
     if not docker:
         return trackers
 
@@ -2286,6 +2438,8 @@ def delete_trackers(docker, trackers, reason="stop", participant=None, actor_rol
         if not tracker.stack_id:
             continue
         stack_query = DockerChallengeTracker.query.filter_by(stack_id=tracker.stack_id)
+        # An old snapshot must not expand to a later launch of the same stack.
+        stack_query = stack_query.filter_by(network_id=tracker.network_id)
         if tracker.instance_key:
             stack_query = stack_query.filter_by(instance_key=tracker.instance_key)
         elif tracker.team_id:
@@ -2299,18 +2453,7 @@ def delete_trackers(docker, trackers, reason="stop", participant=None, actor_rol
         for stack_entry in stack_query.all():
             expanded_trackers[stack_entry.id] = stack_entry
     tracker_rows = list(expanded_trackers.values()) + transient_trackers
-    tracker_fields = (
-        'id', 'team_id', 'user_id', 'docker_image', 'timestamp', 'revert_time',
-        'instance_id', 'ports', 'host', 'challenge', 'challenge_id',
-        'service_name', 'stack_id', 'network_id', 'ports_json', 'instance_key',
-    )
-    trackers = [
-        SimpleNamespace(**{
-            field: getattr(tracker, field, None)
-            for field in tracker_fields
-        })
-        for tracker in tracker_rows
-    ]
+    trackers = snapshot_trackers(tracker_rows)
 
     def tracker_instance_ref(tracker):
         owner_mode = "teams" if tracker.team_id else "users" if tracker.user_id else None
@@ -2343,6 +2486,16 @@ def delete_trackers(docker, trackers, reason="stop", participant=None, actor_rol
             challenge_id,
             for_update=True,
         )
+        if expected_operation_token is not None and (
+            record is None or record.operation_token != expected_operation_token
+        ):
+            db.session.rollback()
+            abort(409, "The Docker lifecycle operation was superseded")
+        tracker_ids = [tracker.id for tracker in referenced_trackers if tracker.id is not None]
+        if tracker_ids and not DockerChallengeTracker.query.filter(DockerChallengeTracker.id.in_(tracker_ids)).first():
+            skipped_refs.add(ref)
+            db.session.rollback()
+            continue
         if reason == "expire" and record is not None and record.state in {
             INSTANCE_CREATING,
             INSTANCE_DELETING,
@@ -2388,6 +2541,7 @@ def delete_trackers(docker, trackers, reason="stop", participant=None, actor_rol
                 operation_token=operation_token,
                 commit=False,
             )
+        backfill_last_started_at(record, referenced_trackers)
         db.session.flush()
         tracker_ids = [tracker.id for tracker in referenced_trackers if tracker.id is not None]
         if tracker_ids:
@@ -2454,7 +2608,11 @@ def delete_trackers(docker, trackers, reason="stop", participant=None, actor_rol
                         )
                 deleted_stacks.add(stack_key)
         else:
-            if delete_container(docker, tracker.instance_id):
+            removed = cleanup_created_resources(docker, container_result={
+                'Id': tracker.instance_id, 'network_id': tracker.network_id,
+                'network_labels': tracker_network_labels(tracker),
+            })
+            if removed:
                 deleted_instances.append(tracker.instance_id)
                 log_audit_event(
                     reason,
@@ -2517,7 +2675,7 @@ def delete_trackers(docker, trackers, reason="stop", participant=None, actor_rol
         if (owner_mode, owner_id, challenge_id) in failed_refs or remaining:
             update_instance_state(record, INSTANCE_FAILED, error=f"Lifecycle operation '{reason}' was incomplete", commit=False)
         else:
-            update_instance_state(record, INSTANCE_STOPPED, commit=False)
+            update_instance_state(record, INSTANCE_DELETING if reason == "revert" else INSTANCE_STOPPED, commit=False)
         db.session.commit()
     return failed
 
@@ -2657,7 +2815,8 @@ class DockerChallengeType(BaseChallenge):
         docker = get_docker_config()
         trackers = DockerChallengeTracker.query.filter(
             (DockerChallengeTracker.challenge_id == challenge.id) |
-            (DockerChallengeTracker.challenge == challenge.name)
+            ((DockerChallengeTracker.challenge_id.is_(None)) &
+             (DockerChallengeTracker.challenge == challenge.name))
         ).all()
         if trackers:
             actor = get_current_user() if has_request_context() else None
@@ -2700,7 +2859,6 @@ class DockerChallengeType(BaseChallenge):
             'name': challenge.name,
             'value': challenge.value,
             'docker_image': challenge.docker_image,
-            'compose_content': challenge.compose_content,
             'published_ports': decode_published_ports(challenge),
             'flag_mode': challenge.flag_mode or 'static',
             'flag_template': challenge.flag_template,
@@ -2716,6 +2874,8 @@ class DockerChallengeType(BaseChallenge):
                 'scripts': DockerChallengeType.scripts,
             }
         }
+        if is_admin():
+            data['compose_content'] = challenge.compose_content
         return data
 
     @staticmethod
@@ -2827,24 +2987,35 @@ class DockerChallenge(Challenges):
 def cleanup_created_resources(docker, stack_result=None, container_result=None):
     """Remove Docker resources that were created before tracker persistence failed."""
     success = True
-    if stack_result:
-        for container in reversed(stack_result.get('containers') or []):
-            if not delete_container(docker, container.get('instance_id')):
+    for result in (stack_result, container_result):
+        if not result:
+            continue
+        containers = [item['instance_id'] for item in reversed(result.get('containers') or [])]
+        if result.get('Id'):
+            containers.append(result['Id'])
+        for container_id in containers:
+            try:
+                if not delete_container(docker, container_id):
+                    success = False
+            except Exception:
+                traceback.print_exc()
                 success = False
-        network_id = stack_result.get('network_id')
-        if network_id and not delete_network(docker, network_id):
-            success = False
-    if container_result and not delete_container(docker, container_result.get('Id')):
-        success = False
+        if result.get('network_id'):
+            try:
+                if not delete_network(docker, result['network_id'], result.get('network_labels')):
+                    success = False
+            except Exception:
+                traceback.print_exc()
+                success = False
     return success
 
 
-def mark_instance_failed(participant, challenge, error):
+def mark_instance_failed(participant, challenge, error, operation_token):
     try:
         db.session.rollback()
         acquire_owner_lock(participant)
         record = get_instance_record(participant, challenge, for_update=True)
-        if record is not None:
+        if record is not None and record.operation_token == operation_token:
             update_instance_state(record, INSTANCE_FAILED, error=error, commit=False)
         db.session.commit()
     except Exception:
@@ -2855,6 +3026,7 @@ def mark_instance_failed(participant, challenge, error):
 def reserve_instance_creation(participant, challenge, trackers, docker):
     """Atomically reserve this owner's challenge slot and return an operation token."""
     acquire_owner_lock(participant)
+    trackers = get_trackers_for_challenge(participant, challenge)
     record = ensure_legacy_instance_record(participant, challenge, trackers)
     now = unix_time(datetime.utcnow())
 
@@ -2862,24 +3034,18 @@ def reserve_instance_creation(participant, challenge, trackers, docker):
         db.session.rollback()
         abort(409, "A Docker lifecycle operation is already in progress for this challenge")
 
-    needs_revert = bool(trackers)
-    if needs_revert:
-        valid_timestamps = []
-        for tracker in trackers:
-            try:
-                valid_timestamps.append(int(tracker.timestamp))
-            except (TypeError, ValueError):
-                pass
-        oldest_timestamp = min(valid_timestamps) if valid_timestamps else now
+    if record is not None and record.last_started_at is not None:
         cooldown = get_revert_cooldown(docker)
-        remaining = cooldown - (now - oldest_timestamp)
+        remaining = cooldown - (now - record.last_started_at)
         if remaining > 0:
             db.session.rollback()
             abort(
                 403,
-                f"To prevent abuse, containers for this challenge can only be reverted every {cooldown} seconds. "
+                f"To prevent abuse, instances for this challenge can only be started or reverted every {cooldown} seconds. "
                 f"Please wait {remaining} more seconds.",
             )
+    needs_revert = bool(trackers)
+    if needs_revert:
         operation_token = secrets.token_hex(16)
         update_instance_state(
             record,
@@ -2945,12 +3111,12 @@ def reserve_instance_creation(participant, challenge, trackers, docker):
     return record, operation_token, False
 
 
-def transition_reserved_instance_to_creating(participant, challenge):
+def transition_reserved_instance_to_creating(participant, challenge, operation_token):
     acquire_owner_lock(participant)
     record = get_instance_record(participant, challenge, for_update=True)
-    if record is None:
+    if record is None or record.state != INSTANCE_DELETING or record.operation_token != operation_token:
         db.session.rollback()
-        raise RuntimeError("Docker lifecycle reservation disappeared")
+        abort(409, "The Docker lifecycle operation was superseded")
     operation_token = secrets.token_hex(16)
     record.created_at = unix_time(datetime.utcnow())
     update_instance_state(
@@ -2973,7 +3139,11 @@ class ContainerAPI(Resource):
     @during_ctf_time_only
     @require_verified_emails
     def post(self):
-        payload = request.get_json(silent=True) or request.args
+        payload = request.get_json(silent=True)
+        if payload is None:
+            payload = request.args
+        if not isinstance(payload, Mapping):
+            return abort(400, "Container requests must be JSON objects")
         challenge_id = payload.get('challenge_id')
         challenge_name = payload.get('challenge')
         stop_container = str(payload.get('stopcontainer', '')).lower() in {'1', 'true', 'yes'}
@@ -2995,24 +3165,25 @@ class ContainerAPI(Resource):
             docker_chal = DockerChallenge.query.filter_by(name=challenge_name).first()
         if docker_chal is None:
             return abort(404, "Docker challenge not found")
-        if docker_chal.state == "hidden":
-            return abort(403, "This challenge is not currently available")
-
         participant = get_participant(required=True)
+        if not stop_container:
+            require_challenge_access(docker_chal, participant)
         cleanup_expired_trackers(docker, participant)
 
         existing = get_trackers_for_challenge(participant, docker_chal)
         if stop_container:
             acquire_owner_lock(participant)
+            existing = get_trackers_for_challenge(participant, docker_chal)
             record = ensure_legacy_instance_record(participant, docker_chal, existing)
             stop_token = secrets.token_hex(16)
             if record is not None:
                 update_instance_state(
                     record,
-                    INSTANCE_DELETING,
+                    INSTANCE_DELETING if existing else INSTANCE_STOPPED,
                     operation_token=stop_token,
                     commit=False,
                 )
+            existing = snapshot_trackers(existing)
             db.session.commit()
             if existing:
                 failed = delete_trackers(
@@ -3023,15 +3194,10 @@ class ContainerAPI(Resource):
                     actor_role="participant",
                     actor_id=participant.id,
                     actor_name=get_participant_name(participant),
+                    expected_operation_token=stop_token,
                 )
                 if failed:
                     return abort(500, "Failed to stop one or more Docker instances")
-            else:
-                acquire_owner_lock(participant)
-                record = get_instance_record(participant, docker_chal, for_update=True)
-                if record is not None:
-                    update_instance_state(record, INSTANCE_STOPPED, commit=False)
-                db.session.commit()
             return {"success": True, "result": "Container stopped"}
 
         record, operation_token, needs_revert = reserve_instance_creation(
@@ -3041,6 +3207,7 @@ class ContainerAPI(Resource):
             docker,
         )
         if needs_revert:
+            existing = get_trackers_for_challenge(participant, docker_chal)
             failed = delete_trackers(
                 docker,
                 existing,
@@ -3049,12 +3216,12 @@ class ContainerAPI(Resource):
                 actor_role="participant",
                 actor_id=participant.id,
                 actor_name=get_participant_name(participant),
+                expected_operation_token=operation_token,
             )
             if failed:
                 return abort(500, "Failed to remove the existing Docker instance before revert")
-            record, operation_token = transition_reserved_instance_to_creating(participant, docker_chal)
+            record, operation_token = transition_reserved_instance_to_creating(participant, docker_chal, operation_token)
 
-        portsbl = get_unavailable_ports(docker)
         now = unix_time(datetime.utcnow())
         host = get_connection_host_value(docker)
         owner_kwargs = get_owner_kwargs(participant)
@@ -3070,6 +3237,7 @@ class ContainerAPI(Resource):
             'ctfd.operation.token': operation_token,
         }
         try:
+            portsbl = get_unavailable_ports(docker)
             runtime_env = build_runtime_env(docker_chal, participant)
         except Exception as exc:
             traceback.print_exc()
@@ -3084,7 +3252,7 @@ class ContainerAPI(Resource):
                 message=f"Failed to build runtime environment: {exc}",
                 ip_address=get_current_request_ip(),
             )
-            mark_instance_failed(participant, docker_chal, exc)
+            mark_instance_failed(participant, docker_chal, exc, operation_token)
             return abort(500, f"Failed to prepare the challenge runtime: {exc}")
 
         stack_result = None
@@ -3113,7 +3281,7 @@ class ContainerAPI(Resource):
                     message=f"Failed to create stack: {exc}",
                     ip_address=get_current_request_ip(),
                 )
-                mark_instance_failed(participant, docker_chal, exc)
+                mark_instance_failed(participant, docker_chal, exc, operation_token)
                 return abort(500, f"Failed to create stack: {exc}")
 
         else:
@@ -3141,7 +3309,7 @@ class ContainerAPI(Resource):
                     message=f"Failed to create container: {exc}",
                     ip_address=get_current_request_ip(),
                 )
-                mark_instance_failed(participant, docker_chal, exc)
+                mark_instance_failed(participant, docker_chal, exc, operation_token)
                 return abort(500, f"Failed to create container: {exc}")
 
         try:
@@ -3196,9 +3364,11 @@ class ContainerAPI(Resource):
                     challenge=challenge_label,
                     challenge_id=docker_chal.id,
                     service_name='primary',
+                    network_id=container_result.get('network_id'),
                     instance_key=instance_key,
                 ))
 
+            locked_record.last_started_at = now
             update_instance_state(locked_record, INSTANCE_RUNNING, operation_token=operation_token, commit=False)
             db.session.commit()
         except HTTPException:
@@ -3211,7 +3381,7 @@ class ContainerAPI(Resource):
                 stack_result=stack_result,
                 container_result=container_result,
             )
-            mark_instance_failed(participant, docker_chal, exc)
+            mark_instance_failed(participant, docker_chal, exc, operation_token)
             return abort(500, "The Docker instance started but could not be recorded; it was rolled back")
 
         entries = DockerChallengeTracker.query.filter_by(instance_key=instance_key).all()
@@ -3455,6 +3625,18 @@ def _ensure_columns(app):
                 if 'reaper_lock_until' not in config_cols:
                     conn.execute(text('ALTER TABLE docker_config ADD COLUMN reaper_lock_until INTEGER'))
 
+        # DockerChallengeInstance cooldown history
+        if insp.has_table('docker_challenge_instance'):
+            instance_cols = {c['name'] for c in insp.get_columns('docker_challenge_instance')}
+            if 'last_started_at' not in instance_cols:
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(text('ALTER TABLE docker_challenge_instance ADD COLUMN last_started_at INTEGER'))
+                except Exception:
+                    refreshed = {c['name'] for c in inspect(engine).get_columns('docker_challenge_instance')}
+                    if 'last_started_at' not in refreshed:
+                        raise
+
         # DockerChallengeTracker columns
         tracker_cols = {c['name'] for c in insp.get_columns('docker_challenge_tracker')} if insp.has_table('docker_challenge_tracker') else set()
         if 'docker_challenge_tracker' in insp.get_table_names():
@@ -3521,6 +3703,25 @@ def _ensure_columns(app):
         if 'docker_audit_log' in insp.get_table_names():
             ensure_index('docker_audit_log', 'ix_docker_audit_log_timestamp', 'timestamp')
             ensure_index('docker_audit_log', 'ix_docker_audit_log_challenge_id', 'challenge_id')
+
+        # Schema changes use separate connections; end any pre-migration read
+        # snapshot before reading the new columns on MySQL/MariaDB.
+        db.session.commit()
+        for record in DockerChallengeInstance.query.filter_by(last_started_at=None).all():
+            owner_field = DockerChallengeTracker.team_id if record.owner_mode == 'teams' else DockerChallengeTracker.user_id
+            trackers = DockerChallengeTracker.query.filter(
+                owner_field == record.owner_id,
+                (DockerChallengeTracker.challenge_id == record.challenge_id) |
+                ((DockerChallengeTracker.challenge_id.is_(None)) &
+                 (DockerChallengeTracker.challenge == record.challenge_name)),
+            ).all()
+            legacy = SimpleNamespace(last_started_at=None)
+            backfill_last_started_at(legacy, trackers)
+            if legacy.last_started_at is not None:
+                DockerChallengeInstance.query.filter_by(id=record.id, last_started_at=None).update(
+                    {'last_started_at': legacy.last_started_at}, synchronize_session=False,
+                )
+        db.session.commit()
 
 
 def load(app):

@@ -196,7 +196,7 @@ function check_nuke_container(instance, all) {
 }
 
 function nuke_container(instance, all) {
-    fetch("/api/v1/nuke", {
+    CTFd.fetch("/api/v1/nuke", {
         method: "POST",
         headers: {
             "Content-Type": "application/json"
