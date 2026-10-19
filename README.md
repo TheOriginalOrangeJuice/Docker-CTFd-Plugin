@@ -2,7 +2,7 @@
 
 Adds a Docker-backed challenge type to CTFd. Players can start an isolated instance of a challenge container or compose stack, receive a dedicated connection port, and stop or revert their own environment without affecting other competitors.
 
-The plugin publishes challenge ports directly from that same host, so players connect back to the CTFd machine at `HOST:PORT`.
+The plugin publishes challenge ports on the configured Docker worker. Players connect to `DOCKER_CHALLENGE_PUBLIC_HOST:PORT`, which can be a separate FRP gateway/VPS rather than the CTFd host.
 
 ## Screenshots
 
@@ -23,11 +23,12 @@ The plugin publishes challenge ports directly from that same host, so players co
 ![Admin Docker status](docs/screenshots/admin-docker-status.png)
 
 
-## Current Setup does the following:
+## Deployment options
 
-- CTFd talks to Docker through the internal proxy
-- Players connect to the same public hostname they already use for CTFd
-- Challenge containers still run on the same machine as CTFd
+- CTFd can use a separate Docker worker over verified mTLS.
+- The plugin assigns worker ports; a centralized FRPC gateway can forward the whole reserved range.
+- The public challenge hostname/IP is independent of the CTFd web hostname.
+- A local internal socket proxy remains an alternative for existing single-host deployments.
 
 ## Installation
 

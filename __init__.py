@@ -1,16 +1,18 @@
 import hashlib
 import hmac
+import ipaddress
 import json
+import math
 import os
 import random
 import re
 import secrets
 import shlex
-import socket
 import tempfile
 import threading
 import time
 import traceback
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -167,6 +169,9 @@ DEFAULT_MAX_SERVICES = 8
 DEFAULT_MAX_PUBLISHED_PORTS = 16
 DEFAULT_HMAC_TEMPLATE = "flag{{HMAC}}"
 DEFAULT_PORT_RETRY_LIMIT = 5
+DEFAULT_MEMORY_LIMIT = "512m"
+DEFAULT_CPU_LIMIT = 1.0
+DEFAULT_PIDS_LIMIT = 256
 INSTANCE_RECONCILE_GRACE = 600
 
 INSTANCE_CREATING = "creating"
@@ -214,6 +219,13 @@ COMPOSE_ALLOWED_KEYS = {
     'pids_limit',
     'shm_size',
 }
+# These options are accepted only inside the reviewed Compose subset, never
+# as arbitrary top-level challenge attributes or participant launch overrides.
+DOCKER_RUNTIME_FIELDS = COMPOSE_ALLOWED_KEYS | COMPOSE_DISALLOWED_KEYS | {
+    'HostConfig', 'NetworkingConfig', 'Mounts', 'Binds', 'Image', 'Env',
+    'Cmd', 'Entrypoint', 'PortBindings', 'ExposedPorts', 'Labels',
+}
+CONTAINER_REQUEST_FIELDS = {'challenge_id', 'challenge', 'name', 'stopcontainer', 'nonce', 'csrf_token'}
 MAX_COMPOSE_BYTES = 128 * 1024
 MAX_YAML_ALIASES = 64
 MAX_SERVICE_MEMORY_BYTES = 16 * 1024 * 1024 * 1024
@@ -334,6 +346,8 @@ def parse_memory_value(value):
     if isinstance(value, bool):
         raise ValueError("Memory limits must be numeric")
     if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("Memory limits must be finite")
         parsed = int(value)
         if parsed <= 0:
             raise ValueError("Memory limits must be greater than zero")
@@ -370,14 +384,15 @@ def parse_memory_value(value):
         "pi": 1024 ** 5,
         "pib": 1024 ** 5,
     }
-    return int(amount * multipliers[unit])
+    size = amount * multipliers[unit]
+    if not math.isfinite(size) or size < 1:
+        raise ValueError("Memory limits must be finite and at least one byte")
+    return int(size)
 
 
 def get_default_memory_limit():
-    try:
-        return parse_memory_value(os.environ.get("DOCKER_CHALLENGE_MEMORY_LIMIT"))
-    except ValueError:
-        return None
+    value = os.environ.get("DOCKER_CHALLENGE_MEMORY_LIMIT") or DEFAULT_MEMORY_LIMIT
+    return parse_memory_value(value)
 
 
 def parse_cpu_value(value):
@@ -389,17 +404,41 @@ def parse_cpu_value(value):
         parsed = float(value)
     except (TypeError, ValueError):
         raise ValueError(f"Invalid CPU limit '{value}'")
-    if parsed <= 0:
-        raise ValueError("CPU limits must be greater than zero")
+    if not math.isfinite(parsed) or parsed <= 0 or parsed * 1_000_000_000 < 1:
+        raise ValueError("CPU limits must be finite and at least one NanoCPU")
     return parsed
 
 
 def get_default_cpu_limit():
-    value = os.environ.get("DOCKER_CHALLENGE_CPU_LIMIT")
+    return parse_cpu_value(os.environ.get("DOCKER_CHALLENGE_CPU_LIMIT") or DEFAULT_CPU_LIMIT)
+
+
+def get_default_pids_limit():
+    value = os.environ.get("DOCKER_CHALLENGE_PIDS_LIMIT") or DEFAULT_PIDS_LIMIT
+    if not re.fullmatch(r"[0-9]+", str(value)):
+        raise ValueError("DOCKER_CHALLENGE_PIDS_LIMIT must be a positive integer")
+    return int(value)
+
+
+def get_challenge_bind_ip():
+    """Docker's HostIp is an address on the worker, not the CTFd host."""
+    value = os.environ.get("DOCKER_CHALLENGE_BIND_IP")
     if value in (None, ""):
         return None
-    parsed = get_plugin_setting_float("DOCKER_CHALLENGE_CPU_LIMIT", 0.0, minimum=0.0)
-    return parsed or None
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise ValueError("DOCKER_CHALLENGE_BIND_IP must be a literal IPv4 or IPv6 address") from exc
+    if '%' in value or address.is_multicast:
+        raise ValueError("DOCKER_CHALLENGE_BIND_IP cannot be scoped or multicast")
+    return str(address)
+
+
+def build_port_binding(port, bind_ip):
+    binding = {'HostPort': str(port)}
+    if bind_ip is not None:
+        binding['HostIp'] = bind_ip
+    return binding
 
 
 def get_reaper_interval():
@@ -586,7 +625,10 @@ def get_instance_record_by_identity(owner_mode, owner_id, challenge_id, for_upda
         challenge_id=challenge_id,
     )
     if for_update:
-        query = query.with_for_update()
+        # A request can retain this row across slow remote Docker calls while
+        # another request changes it. Row locking alone does not refresh the
+        # SQLAlchemy identity map; always reload before checking its token.
+        query = query.populate_existing().with_for_update()
     return query.first()
 
 
@@ -610,7 +652,7 @@ def acquire_owner_lock_by_identity(owner_mode, owner_id):
     lock_row = DockerOwnerLock.query.filter_by(
         owner_mode=owner_mode,
         owner_id=owner_id,
-    ).with_for_update().first()
+    ).populate_existing().with_for_update().first()
     if lock_row is None:
         raise RuntimeError("Unable to acquire the Docker instance owner lock")
 
@@ -1275,26 +1317,81 @@ def get_repositories(docker, tags=False, repos=None):
 
 
 def get_unavailable_ports(docker):
+    """Conservatively reserve remote Docker bindings across IPs and protocols.
+
+    HostConfig includes fixed bindings of created/stopped containers, which the
+    list endpoint's Ports can omit. Docker start remains the final arbiter for
+    simultaneous requests and non-Docker listeners on the remote worker.
+    """
     response = do_request(docker, '/containers/json?all=1')
-    containers = parse_response_json(response, default=[]) or []
-    result = []
+    containers = parse_response_json(response)
+    if response is None or response.status_code >= 400 or not isinstance(containers, list):
+        raise RuntimeError("Cannot inspect remote Docker port allocations")
+    used = set()
+
+    def add_port(value):
+        if value in (None, '', '0', 0):
+            return
+        try:
+            port = int(value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Remote Docker returned an invalid host port") from exc
+        if isinstance(value, bool) or not 1 <= port <= 65535:
+            raise RuntimeError("Remote Docker returned an invalid host port")
+        used.add(port)
+
     for container in containers:
+        if not isinstance(container, dict) or not container.get('Id'):
+            raise RuntimeError("Remote Docker returned an invalid container list")
         for port in container.get('Ports') or []:
-            public_port = port.get('PublicPort')
-            if public_port is not None:
-                result.append(int(public_port))
-    return result
+            add_port(port.get('PublicPort'))
+        response = inspect_named_container(docker, container['Id'])
+        if response is not None and response.status_code == 404:
+            continue  # Removed between list and inspect; retain the snapshot's ports.
+        details = parse_response_json(response)
+        if response is None or response.status_code >= 400 or not isinstance(details, dict):
+            raise RuntimeError("Cannot inspect remote Docker container port bindings")
+        for section, field in (('HostConfig', 'PortBindings'), ('NetworkSettings', 'Ports')):
+            bindings = (details.get(section) or {}).get(field) or {}
+            if not isinstance(bindings, dict):
+                raise RuntimeError("Remote Docker returned invalid port bindings")
+            for entries in bindings.values():
+                for binding in entries or []:
+                    add_port(binding.get('HostPort'))
+    return sorted(used)
+
+
+def refresh_unavailable_ports(docker, used_ports):
+    # Never forget a port attempted by this request, even after its failed
+    # container is removed. Refresh also observes other workers' new bindings.
+    used_ports[:] = sorted(set(used_ports) | set(get_unavailable_ports(docker)))
+
+
+def inspect_challenge_image(docker, image):
+    response = do_request(docker, f"/images/{quote(image, safe='')}/json")
+    if response is None or response.status_code >= 400:
+        error = response.text if response is not None else "no response"
+        raise RuntimeError(f"Image '{image}' could not be inspected: {error}")
+    details = parse_response_json(response)
+    if not isinstance(details, dict) or not isinstance(details.get('Id'), str) or not details['Id']:
+        raise RuntimeError(f"Docker returned invalid metadata for image '{image}'")
+    allowed = normalize_repo_selection(docker.repositories if docker else None)
+    if not image_is_allowed(image, allowed):
+        raise ValueError(f"Image '{image}' is not in the configured repository allow-list")
+    if allowed:
+        # Authorize the resolved image, not only the requested spelling. Do not
+        # rely on every Docker backend resolving named/digested aliases alike.
+        refs = (details.get('RepoTags') or []) + (details.get('RepoDigests') or [])
+        requested_repo = get_repository_name(image)
+        if not any(get_repository_name(ref) == requested_repo for ref in refs):
+            raise ValueError(f"Resolved image '{image}' has no reference in its approved repository")
+    return details
 
 
 def get_required_ports(docker, image):
-    response = do_request(docker, f"/images/{quote(image, safe='')}/json")
-    if response is None:
-        raise RuntimeError(f"Failed to inspect image '{image}'")
-    if response.status_code >= 400:
-        raise RuntimeError(f"Image '{image}' could not be inspected: {response.text}")
-
-    exposed = (parse_response_json(response, default={}) or {}).get('Config', {}).get('ExposedPorts', {})
-    return sorted(exposed.keys()) if exposed else []
+    details = inspect_challenge_image(docker, image)
+    exposed = (details.get('Config') or {}).get('ExposedPorts') or {}
+    return sorted(exposed)
 
 
 def normalize_published_ports(value):
@@ -1336,22 +1433,9 @@ def decode_published_ports(challenge):
     raw = getattr(challenge, 'published_ports', None)
     if raw in (None, ''):
         return None
-    try:
-        return normalize_published_ports(raw)
-    except ValueError:
-        return None
-
-
-def is_host_port_available(port, protocol='tcp'):
-    socket_type = socket.SOCK_DGRAM if str(protocol).lower() == 'udp' else socket.SOCK_STREAM
-    test_socket = socket.socket(socket.AF_INET, socket_type)
-    try:
-        test_socket.bind(("0.0.0.0", int(port)))
-        return True
-    except OSError:
-        return False
-    finally:
-        test_socket.close()
+    # Invalid stored selections must not silently fall back to publishing all
+    # image-exposed ports (the legacy None behavior is only for unset values).
+    return normalize_published_ports(raw)
 
 
 def is_port_conflict_error(message):
@@ -1368,19 +1452,15 @@ def is_port_conflict_error(message):
 
 
 def pick_available_host_port(used_ports, protocol='tcp'):
+    # A socket on the CTFd machine says nothing about a remote Docker worker.
     port_min, port_max = get_port_bounds()
     used = {int(port) for port in used_ports}
     candidates = [port for port in range(port_min, port_max + 1) if port not in used]
-    random.shuffle(candidates)
-    for selected in candidates:
-        if not is_host_port_available(selected, protocol=protocol):
-            used_ports.append(selected)
-            continue
-        used_ports.append(selected)
-        return selected
     if not candidates:
         raise RuntimeError("No free Docker challenge ports are available in the configured range")
-    raise RuntimeError("No bindable Docker challenge ports are available in the configured range")
+    selected = random.choice(candidates)
+    used_ports.append(selected)
+    return selected
 
 
 def sanitize_container_name(value, max_length=64):
@@ -1398,6 +1478,11 @@ def build_container_name(image, owner_identity, challenge_id):
 def build_stack_name(owner_identity, challenge_id):
     owner_hash = hashlib.sha256(str(owner_identity).encode("utf-8")).hexdigest()[:12]
     return sanitize_container_name(f"ctfd_s{challenge_id}_{owner_hash}")
+
+
+def build_instance_network_name(owner_identity, challenge_id, operation_token):
+    identity = f'{owner_identity}:{challenge_id}:{operation_token}'
+    return 'ctfd_n_' + hashlib.sha256(identity.encode()).hexdigest()[:32]
 
 
 def build_service_container_name(stack_id, service_name):
@@ -1428,33 +1513,33 @@ def parse_optional_bool(value):
 
 
 def build_resource_host_config(service=None):
-    host_config = {}
-
-    memory_limit = None
-    cpu_limit = None
-    if service:
-        memory_limit = service.get('memory_limit')
-        cpu_limit = service.get('cpu_limit')
-
-    if memory_limit is None:
-        memory_limit = get_default_memory_limit()
-    if cpu_limit is None:
-        cpu_limit = get_default_cpu_limit()
-
-    if memory_limit:
-        host_config['Memory'] = int(memory_limit)
-    if cpu_limit:
-        host_config['NanoCpus'] = int(float(cpu_limit) * 1_000_000_000)
-    if service:
-        if service.get('cap_drop'):
-            host_config['CapDrop'] = service['cap_drop']
-        if service.get('read_only'):
-            host_config['ReadonlyRootfs'] = True
-        if service.get('pids_limit') is not None:
-            host_config['PidsLimit'] = int(service['pids_limit'])
-        if service.get('shm_size') is not None:
-            host_config['ShmSize'] = int(service['shm_size'])
-
+    """Shared resource defaults and mandatory security baseline for both modes."""
+    service = service or {}
+    memory = service.get('memory_limit')
+    cpu = service.get('cpu_limit')
+    pids = service.get('pids_limit')
+    memory = get_default_memory_limit() if memory is None else memory
+    cpu = get_default_cpu_limit() if cpu is None else cpu
+    pids = get_default_pids_limit() if pids is None else pids
+    if not 0 < memory <= MAX_SERVICE_MEMORY_BYTES:
+        raise ValueError("Memory limits must be positive and at most 16 GiB")
+    if not math.isfinite(cpu) or not 0 < cpu <= MAX_SERVICE_CPUS:
+        raise ValueError(f"CPU limits must be positive and at most {MAX_SERVICE_CPUS:g}")
+    if not 1 <= pids <= MAX_SERVICE_PIDS:
+        raise ValueError(f"PID limits must be between 1 and {MAX_SERVICE_PIDS}")
+    host_config = {
+        'Memory': int(memory),
+        'NanoCpus': int(cpu * 1_000_000_000),
+        'PidsLimit': int(pids),
+        'Privileged': False,
+        'PidMode': '',
+        'IpcMode': 'private',
+        'SecurityOpt': ['no-new-privileges:true'],
+        'CapDrop': sorted({'NET_RAW'} | set(service.get('cap_drop') or [])),
+        'ReadonlyRootfs': bool(service.get('read_only')),
+    }
+    if service.get('shm_size') is not None:
+        host_config['ShmSize'] = int(service['shm_size'])
     return host_config
 
 
@@ -1472,6 +1557,63 @@ def inspect_named_network(docker, network_name):
     return do_request(docker, f"/networks/{quote(network_name, safe='')}")
 
 
+def resource_labels_match(actual, expected):
+    """Require plugin ownership and the caller's instance/operation identity."""
+    if not isinstance(actual, Mapping) or not isinstance(expected, Mapping):
+        return False
+    actual, expected = actual or {}, expected or {}
+    if actual.get('ctfd.plugin') != PLUGIN_LABEL or expected.get('ctfd.plugin') != PLUGIN_LABEL:
+        return False
+    legacy_stack_owner = (expected.get('ctfd.stack.id') and expected.get('ctfd.owner.id')
+                          and expected.get('ctfd.owner.mode') in {'teams', 'users'})
+    if not get_resource_instance_key(expected) and not legacy_stack_owner:
+        return False
+    for key in ('ctfd.challenge.id', 'ctfd.owner.id', 'ctfd.owner.mode',
+                'ctfd.stack.id', 'ctfd.operation.token'):
+        if expected.get(key) and actual.get(key) != expected[key]:
+            return False
+    expected_key = get_resource_instance_key(expected)
+    return not expected_key or get_resource_instance_key(actual) == expected_key
+
+
+def tracker_network_labels(tracker):
+    """Legacy rows may lack network_id/instance_key; never infer a network ID."""
+    labels = {'ctfd.plugin': PLUGIN_LABEL}
+    if tracker.team_id or tracker.user_id:
+        labels['ctfd.owner.mode'] = 'teams' if tracker.team_id else 'users'
+        labels['ctfd.owner.id'] = str(tracker.team_id or tracker.user_id)
+    if tracker.challenge_id is not None:
+        labels['ctfd.challenge.id'] = str(tracker.challenge_id)
+    if tracker.instance_key:
+        labels['ctfd.instance.key'] = tracker.instance_key
+    if tracker.stack_id:
+        labels['ctfd.stack.id'] = tracker.stack_id
+    return labels
+
+
+def create_instance_network(docker, network_name, labels):
+    """Use Docker's bridge/NAT defaults and daemon-managed address pool."""
+    payload = {'Name': network_name, 'Driver': 'bridge', 'CheckDuplicate': True, 'Labels': labels}
+    try:
+        response = do_request_with_body(docker, '/networks/create', data=payload)
+        if response is not None and response.status_code == 409 and cleanup_conflicting_network(docker, network_name, labels):
+            response = do_request_with_body(docker, '/networks/create', data=payload)
+        if response is None or response.status_code >= 400:
+            raise RuntimeError(f"Failed to create network: {response.text if response is not None else 'no response'}")
+        details = parse_response_json(response, default={}) or {}
+        if not isinstance(details, dict) or not details.get('Id'):
+            raise RuntimeError('Docker did not return a network id')
+        return details['Id']
+    except Exception:
+        # The worker may have accepted creation even if its reply was lost.
+        # Inspect by name and remove only this operation's empty network.
+        try:
+            delete_network(docker, network_name, labels)
+        except Exception:
+            traceback.print_exc()
+        raise
+
+
 def cleanup_conflicting_container(docker, container_name, expected_labels):
     inspect_response = inspect_named_container(docker, container_name)
     if inspect_response is None or inspect_response.status_code >= 400:
@@ -1481,7 +1623,7 @@ def cleanup_conflicting_container(docker, container_name, expected_labels):
     labels = details.get("Config", {}).get("Labels", {}) or {}
     if labels.get("ctfd.plugin") != PLUGIN_LABEL:
         return False
-    for key in ("ctfd.challenge.id", "ctfd.owner.id", "ctfd.owner.mode"):
+    for key in ("ctfd.challenge.id", "ctfd.owner.id", "ctfd.owner.mode", "ctfd.instance.key", "ctfd.operation.token"):
         if expected_labels.get(key) and labels.get(key) != expected_labels.get(key):
             return False
     return delete_container(docker, details.get("Id") or container_name)
@@ -1493,12 +1635,12 @@ def cleanup_conflicting_network(docker, network_name, expected_labels):
         return False
 
     details = parse_response_json(inspect_response, default={}) or {}
-    labels = details.get("Labels", {}) or {}
-    if labels.get("ctfd.plugin") != PLUGIN_LABEL:
+    if (not isinstance(details, dict) or details.get('Name') in {'bridge', 'host', 'none'}
+            or details.get('Driver') != 'bridge'):
         return False
-    for key in ("ctfd.challenge.id", "ctfd.owner.id", "ctfd.owner.mode", "ctfd.stack.id"):
-        if expected_labels.get(key) and labels.get(key) != expected_labels.get(key):
-            return False
+    labels = details.get("Labels", {}) or {}
+    if not resource_labels_match(labels, expected_labels):
+        return False
 
     for container_id in (details.get("Containers") or {}).keys():
         if not container_id:
@@ -1508,15 +1650,14 @@ def cleanup_conflicting_network(docker, network_name, expected_labels):
             return False
         container_details = parse_response_json(container_response, default={}) or {}
         container_labels = container_details.get("Config", {}).get("Labels", {}) or {}
-        if container_labels.get("ctfd.plugin") != PLUGIN_LABEL:
-            return False
-        if container_labels.get("ctfd.stack.id") != expected_labels.get("ctfd.stack.id"):
+        if not resource_labels_match(container_labels, expected_labels):
             return False
 
     for container_id in (details.get("Containers") or {}).keys():
-        delete_container(docker, container_id)
+        if not delete_container(docker, container_id):
+            return False
     network_id = details.get("Id") or network_name
-    return delete_network(docker, network_id)
+    return delete_network(docker, network_id, expected_labels)
 
 
 def create_container(docker, image, owner_identity, challenge_id, portbl, labels=None, env_vars=None, selected_ports=None):
@@ -1527,10 +1668,15 @@ def create_container(docker, image, owner_identity, challenge_id, portbl, labels
     if not image_is_allowed(image, allowed_repositories):
         raise ValueError(f"Image '{image}' is not in the configured repository allow-list")
 
-    available_ports = get_required_ports(docker, image)
+    bind_ip = get_challenge_bind_ip()
+    resources = build_resource_host_config()
+    image_details = inspect_challenge_image(docker, image)
+    available_ports = normalize_published_ports(sorted((image_details.get('Config') or {}).get('ExposedPorts') or {}))
     needed_ports = normalize_published_ports(selected_ports) if selected_ports is not None else available_ports
     if not needed_ports:
         raise ValueError(f"No published ports are configured for image '{image}'")
+    if len(needed_ports) > get_max_published_ports():
+        raise ValueError(f"A challenge may publish at most {get_max_published_ports()} ports")
     unavailable = sorted(set(needed_ports) - set(available_ports))
     if unavailable:
         raise ValueError(
@@ -1538,86 +1684,119 @@ def create_container(docker, image, owner_identity, challenge_id, portbl, labels
         )
 
     container_name = build_container_name(image, owner_identity, challenge_id)
+    instance_labels = {
+        'ctfd.plugin': PLUGIN_LABEL,
+        'ctfd.challenge.id': str(challenge_id),
+        'ctfd.instance.key': str(owner_identity),
+        **(labels or {}),
+    }
+    instance_labels.setdefault('ctfd.operation.token', secrets.token_hex(16))
+    network_name = build_instance_network_name(owner_identity, challenge_id, instance_labels['ctfd.operation.token'])
     retry_limit = get_port_retry_limit()
     last_error = None
     for attempt in range(retry_limit):
-        exposed_ports = {}
-        port_bindings = {}
-        assigned_host_ports = []
-        for port_spec in needed_ports:
-            protocol = port_spec.split("/", 1)[1] if "/" in port_spec else "tcp"
-            host_port = pick_available_host_port(portbl, protocol=protocol)
-            exposed_ports[port_spec] = {}
-            port_bindings[port_spec] = [{"HostPort": str(host_port)}]
-            assigned_host_ports.append(f"{host_port}/{protocol}")
+        network_id = None
+        container_id = None
+        try:
+            refresh_unavailable_ports(docker, portbl)
+            network_id = create_instance_network(docker, network_name, instance_labels)
+            exposed_ports = {}
+            port_bindings = {}
+            assigned_host_ports = []
+            for port_spec in needed_ports:
+                protocol = port_spec.split("/", 1)[1] if "/" in port_spec else "tcp"
+                host_port = pick_available_host_port(portbl, protocol=protocol)
+                exposed_ports[port_spec] = {}
+                port_bindings[port_spec] = [build_port_binding(host_port, bind_ip)]
+                assigned_host_ports.append(f"{host_port}/{protocol}")
 
-        host_config = {
-            'PortBindings': port_bindings,
-            **build_resource_host_config(),
-        }
-        payload = {
-            "Image": image,
-            "ExposedPorts": exposed_ports,
-            "HostConfig": host_config,
-            "Labels": labels or {},
-        }
-        env_list = build_env_list(env_vars)
-        if env_list:
-            payload["Env"] = env_list
+            payload = {
+                "Image": image_details['Id'],
+                "ExposedPorts": exposed_ports,
+                "HostConfig": {
+                    'NetworkMode': network_id,
+                    'PortBindings': port_bindings,
+                    **resources,
+                },
+                "NetworkingConfig": {'EndpointsConfig': {network_id: {}}},
+                "Labels": instance_labels,
+            }
+            env_list = build_env_list(env_vars)
+            if env_list:
+                payload["Env"] = env_list
 
-        response = do_request_with_body(
-            docker,
-            f"/containers/create?name={quote(container_name, safe='')}",
-            data=payload,
-            method='POST',
-        )
-        if response is not None and response.status_code == 409 and cleanup_conflicting_container(docker, container_name, labels or {}):
             response = do_request_with_body(
                 docker,
                 f"/containers/create?name={quote(container_name, safe='')}",
                 data=payload,
                 method='POST',
             )
-        if response is None or response.status_code >= 400:
-            error_text = response.text if response is not None else "no response"
-            last_error = RuntimeError(f"Failed to create container from '{image}': {error_text}")
-            if not is_port_conflict_error(error_text) or attempt == retry_limit - 1:
-                raise last_error
-            continue
+            if response is not None and response.status_code == 409 and cleanup_conflicting_container(docker, container_name, instance_labels):
+                response = do_request_with_body(
+                    docker,
+                    f"/containers/create?name={quote(container_name, safe='')}",
+                    data=payload,
+                    method='POST',
+                )
+            if response is None or response.status_code >= 400:
+                error_text = response.text if response is not None else "no response"
+                raise RuntimeError(f"Failed to create container from '{image}': {error_text}")
 
-        result = parse_response_json(response, default={}) or {}
-        container_id = result.get('Id')
-        if not container_id:
-            raise RuntimeError(f"Docker did not return a container id for '{image}'")
+            result = parse_response_json(response, default={}) or {}
+            container_id = result.get('Id')
+            if not container_id:
+                raise RuntimeError(f"Docker did not return a container id for '{image}'")
 
-        start_response = do_request_with_body(docker, f"/containers/{container_id}/start", method='POST')
-        if start_response is None or (start_response.status_code >= 400 and start_response.status_code != 304):
-            delete_container(docker, container_id)
-            error_text = start_response.text if start_response is not None else "no response"
-            last_error = RuntimeError(f"Failed to start container '{container_id}': {error_text}")
-            if not is_port_conflict_error(error_text) or attempt == retry_limit - 1:
-                raise last_error
-            continue
+            start_response = do_request_with_body(docker, f"/containers/{container_id}/start", method='POST')
+            if start_response is None or (start_response.status_code >= 400 and start_response.status_code != 304):
+                error_text = start_response.text if start_response is not None else "no response"
+                raise RuntimeError(f"Failed to start container '{container_id}': {error_text}")
 
-        return {
-            'Id': container_id,
-            'ports': assigned_host_ports,
-            'config': payload,
-        }
+            return {
+                'Id': container_id,
+                'ports': assigned_host_ports,
+                'config': payload,
+                'network_id': network_id,
+                'network_labels': instance_labels,
+            }
+        except Exception as exc:
+            last_error = exc
+            cleaned = cleanup_created_resources(docker, container_result={
+                'Id': container_id, 'network_id': network_id, 'network_labels': instance_labels,
+            })
+            if not cleaned or not is_port_conflict_error(exc) or attempt == retry_limit - 1:
+                raise
 
     raise last_error or RuntimeError(f"Failed to create container from '{image}'")
 
 
 def delete_container(docker, instance_id):
     headers = {'Content-Type': "application/json"}
-    response = do_request(docker, f'/containers/{instance_id}?force=true', headers=headers, method='DELETE')
+    response = do_request(docker, f'/containers/{instance_id}?force=true&v=true', headers=headers, method='DELETE')
     if response is None:
         return False
     return response.status_code == 404 or response.status_code < 400
 
 
-def delete_network(docker, network_id):
-    response = do_request(docker, f'/networks/{network_id}', method='DELETE')
+def delete_network(docker, network_id, expected_labels):
+    """Never remove shared/foreign networks or detach unknown endpoints."""
+    if network_id in {'bridge', 'host', 'none'}:
+        return False
+    inspected = inspect_named_network(docker, network_id)
+    if inspected is None:
+        return False
+    if inspected.status_code == 404:
+        return True
+    if inspected.status_code >= 400:
+        return False
+    details = parse_response_json(inspected, default={}) or {}
+    if (not isinstance(details, dict)
+            or details.get('Name') in {'bridge', 'host', 'none'}
+            or details.get('Driver') != 'bridge'
+            or not resource_labels_match(details.get('Labels'), expected_labels)
+            or details.get('Containers')):
+        return False
+    response = do_request(docker, f"/networks/{quote(details.get('Id') or network_id, safe='')}", method='DELETE')
     if response is None:
         return False
     return response.status_code == 404 or response.status_code < 400
@@ -1766,7 +1945,7 @@ def reconcile_docker_resources(docker):
         )
         if protected_creation:
             continue
-        if delete_network(docker, network_id):
+        if delete_network(docker, network_id, labels):
             audit_messages.append(("reconcile_orphan", f"Removed Docker network {network_id}"))
 
     for instance_key, record in records.items():
@@ -2060,13 +2239,23 @@ def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl,
                 f"Service '{service_name}' uses image '{service['image']}' which is not in the configured repository allow-list"
             )
 
+    bind_ip = get_challenge_bind_ip()
+    resources = {name: build_resource_host_config(svc) for name, svc in services.items()}
+    # Resolve all images before creating any network/container. A mutable tag
+    # cannot switch the image between validation/inspection and Docker create.
+    image_ids = {name: inspect_challenge_image(docker, svc['image'])['Id']
+                 for name, svc in services.items()}
     stack_id = build_stack_name(owner_identity, challenge_id)
     host_value = get_connection_host_value(docker)
     network_labels = {
         'ctfd.plugin': PLUGIN_LABEL,
+        'ctfd.challenge.id': str(challenge_id),
+        'ctfd.instance.key': str(owner_identity),
         'ctfd.stack.id': stack_id,
         **(labels or {}),
     }
+    network_labels.setdefault('ctfd.operation.token', secrets.token_hex(16))
+    network_name = build_instance_network_name(owner_identity, challenge_id, network_labels['ctfd.operation.token'])
     order = _topo_sort_services(services)
     last_error = None
     retry_limit = get_port_retry_limit()
@@ -2075,20 +2264,8 @@ def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl,
         network_id = ""
         created = []
         try:
-            net_resp = do_request_with_body(docker, '/networks/create', data={
-                'Name': stack_id,
-                'Driver': 'bridge',
-                'Labels': network_labels,
-            })
-            if net_resp is not None and net_resp.status_code == 409 and cleanup_conflicting_network(docker, stack_id, network_labels):
-                net_resp = do_request_with_body(docker, '/networks/create', data={
-                    'Name': stack_id,
-                    'Driver': 'bridge',
-                    'Labels': network_labels,
-                })
-            if net_resp is None or net_resp.status_code >= 400:
-                raise RuntimeError(f"Failed to create network: {net_resp.text if net_resp else 'no response'}")
-            network_id = net_resp.json().get('Id', '')
+            refresh_unavailable_ports(docker, portbl)
+            network_id = create_instance_network(docker, network_name, network_labels)
 
             port_map = {}
             placeholder_port_map = {}
@@ -2148,7 +2325,7 @@ def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl,
                     key = f"{p['target']}/{p['protocol']}"
                     exposed_ports[key] = {}
                     host_port = port_map[svc_name][(p['target'], p['protocol'])]
-                    port_bindings[key] = [{'HostPort': str(host_port)}]
+                    port_bindings[key] = [build_port_binding(host_port, bind_ip)]
                     assigned_host_ports.append(f"{host_port}/{p['protocol']}")
                     port_mappings.append({
                         'target': p['target'],
@@ -2157,26 +2334,23 @@ def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl,
                     })
 
                 config = {
-                    'Image': svc['image'],
+                    'Image': image_ids[svc_name],
                     'Env': env_list,
                     'HostConfig': {
-                        'NetworkMode': stack_id,
+                        'NetworkMode': network_id,
                         'PortBindings': port_bindings if port_bindings else None,
-                        **build_resource_host_config(svc),
+                        **resources[svc_name],
                     },
                     'NetworkingConfig': {
                         'EndpointsConfig': {
-                            stack_id: {
+                            network_id: {
                                 'Aliases': [svc_name],
                             }
                         }
                     },
                     'Labels': {
-                        'ctfd.plugin': PLUGIN_LABEL,
-                        'ctfd.challenge.id': str(challenge_id),
-                        'ctfd.stack.id': stack_id,
+                        **network_labels,
                         'ctfd.service.name': svc_name,
-                        **(labels or {}),
                     },
                 }
 
@@ -2205,12 +2379,6 @@ def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl,
                     raise RuntimeError(f"Failed to create container '{svc_name}': {error_text}")
 
                 container_id = resp.json()['Id']
-                start_resp = do_request_with_body(docker, f'/containers/{container_id}/start')
-                if start_resp is None or (start_resp.status_code >= 400 and start_resp.status_code != 304):
-                    error_text = start_resp.text if start_resp is not None else 'no response'
-                    delete_container(docker, container_id)
-                    raise RuntimeError(f"Failed to start container '{svc_name}': {error_text}")
-
                 created.append({
                     'service_name': svc_name,
                     'instance_id': container_id,
@@ -2218,25 +2386,23 @@ def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl,
                     'ports': ','.join(assigned_host_ports) if assigned_host_ports else '',
                     'port_mappings': port_mappings,
                 })
+                start_resp = do_request_with_body(docker, f'/containers/{container_id}/start')
+                if start_resp is None or (start_resp.status_code >= 400 and start_resp.status_code != 304):
+                    error_text = start_resp.text if start_resp is not None else 'no response'
+                    raise RuntimeError(f"Failed to start container '{svc_name}': {error_text}")
 
             return {
                 'stack_id': stack_id,
                 'network_id': network_id,
+                'network_labels': network_labels,
                 'containers': created,
             }
         except Exception as exc:
             last_error = exc
-            for container in created:
-                try:
-                    delete_container(docker, container['instance_id'])
-                except Exception:
-                    pass
-            if network_id:
-                try:
-                    delete_network(docker, network_id)
-                except Exception:
-                    pass
-            if not is_port_conflict_error(exc) or attempt == retry_limit - 1:
+            cleaned = cleanup_created_resources(docker, stack_result={
+                'containers': created, 'network_id': network_id, 'network_labels': network_labels,
+            })
+            if not cleaned or not is_port_conflict_error(exc) or attempt == retry_limit - 1:
                 raise
 
     raise last_error or RuntimeError("Failed to create compose stack")
@@ -2245,21 +2411,20 @@ def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl,
 def delete_stack(docker, stack_id, entries=None):
     """Delete all containers and network for a compose stack, and clean up DB."""
     entries = list(entries) if entries is not None else DockerChallengeTracker.query.filter_by(stack_id=stack_id).all()
-    network_id = None
     success = True
     for entry in entries:
-        if entry.network_id:
-            network_id = entry.network_id
         try:
             if not delete_container(docker, entry.instance_id):
                 success = False
         except:
             traceback.print_exc()
             success = False
-    if network_id:
+    networks = {entry.network_id: tracker_network_labels(entry) for entry in entries if entry.network_id}
+    if success:
         try:
-            if not delete_network(docker, network_id):
-                success = False
+            for network_id, labels in networks.items():
+                if not delete_network(docker, network_id, labels):
+                    success = False
         except:
             traceback.print_exc()
             success = False
@@ -2454,7 +2619,10 @@ def delete_trackers(docker, trackers, reason="stop", participant=None, actor_rol
                         )
                 deleted_stacks.add(stack_key)
         else:
-            if delete_container(docker, tracker.instance_id):
+            removed = delete_container(docker, tracker.instance_id)
+            if removed and tracker.network_id:
+                removed = delete_network(docker, tracker.network_id, tracker_network_labels(tracker))
+            if removed:
                 deleted_instances.append(tracker.instance_id)
                 log_audit_event(
                     reason,
@@ -2529,6 +2697,10 @@ def normalize_challenge_payload(data):
     else:
         submitted_ports = data.get('published_ports') if ports_field_present else None
     normalized = dict(data)
+    unsupported_runtime = set(normalized) & DOCKER_RUNTIME_FIELDS
+    if unsupported_runtime:
+        abort(400, "Runtime options must use the supported Compose configuration: "
+              + ', '.join(sorted(unsupported_runtime)))
     mode = normalized.get('docker_mode')
     compose_content = (normalized.get('compose_content') or '').strip()
     docker_image = (normalized.get('docker_image') or '').strip()
@@ -2589,7 +2761,7 @@ def normalize_challenge_payload(data):
                 abort(503, "Docker must be configured before selecting published ports")
             try:
                 available_ports = get_required_ports(docker_config, docker_image)
-            except RuntimeError as exc:
+            except (RuntimeError, ValueError) as exc:
                 abort(400, str(exc))
             unavailable = sorted(set(selected_ports) - set(available_ports))
             if unavailable:
@@ -2827,26 +2999,42 @@ class DockerChallenge(Challenges):
 def cleanup_created_resources(docker, stack_result=None, container_result=None):
     """Remove Docker resources that were created before tracker persistence failed."""
     success = True
-    if stack_result:
-        for container in reversed(stack_result.get('containers') or []):
-            if not delete_container(docker, container.get('instance_id')):
+    for result in (stack_result, container_result):
+        if not result:
+            continue
+        containers = [item.get('instance_id') for item in reversed(result.get('containers') or [])]
+        if result.get('Id'):
+            containers.append(result['Id'])
+        for container_id in containers:
+            try:
+                if not delete_container(docker, container_id):
+                    success = False
+            except Exception:
+                traceback.print_exc()
                 success = False
-        network_id = stack_result.get('network_id')
-        if network_id and not delete_network(docker, network_id):
-            success = False
-    if container_result and not delete_container(docker, container_result.get('Id')):
-        success = False
+        network_id = result.get('network_id')
+        if network_id:
+            try:
+                if not delete_network(docker, network_id, result.get('network_labels')):
+                    success = False
+            except Exception:
+                traceback.print_exc()
+                success = False
     return success
 
 
-def mark_instance_failed(participant, challenge, error):
+def mark_instance_failed(participant, challenge, error, operation_token=None):
     try:
         db.session.rollback()
         acquire_owner_lock(participant)
         record = get_instance_record(participant, challenge, for_update=True)
-        if record is not None:
+        if record is not None and (operation_token is None or record.operation_token == operation_token):
             update_instance_state(record, INSTANCE_FAILED, error=error, commit=False)
-        db.session.commit()
+            db.session.commit()
+        else:
+            # A stop/restart may have superseded this request while Docker was
+            # responding. Its failure must not clobber the newer lifecycle row.
+            db.session.rollback()
     except Exception:
         traceback.print_exc()
         db.session.rollback()
@@ -2973,7 +3161,13 @@ class ContainerAPI(Resource):
     @during_ctf_time_only
     @require_verified_emails
     def post(self):
-        payload = request.get_json(silent=True) or request.args
+        payload = request.get_json(silent=True)
+        if payload is None:
+            payload = request.args
+        if not isinstance(payload, Mapping):
+            return abort(400, "Container requests must be JSON objects")
+        if set(payload) - CONTAINER_REQUEST_FIELDS:
+            return abort(400, "Runtime overrides are not accepted; use the saved challenge configuration")
         challenge_id = payload.get('challenge_id')
         challenge_name = payload.get('challenge')
         stop_container = str(payload.get('stopcontainer', '')).lower() in {'1', 'true', 'yes'}
@@ -3054,7 +3248,9 @@ class ContainerAPI(Resource):
                 return abort(500, "Failed to remove the existing Docker instance before revert")
             record, operation_token = transition_reserved_instance_to_creating(participant, docker_chal)
 
-        portsbl = get_unavailable_ports(docker)
+        # The creation helpers inspect Docker inside the guarded launch path;
+        # an unavailable worker must transition the reservation to failed.
+        portsbl = []
         now = unix_time(datetime.utcnow())
         host = get_connection_host_value(docker)
         owner_kwargs = get_owner_kwargs(participant)
@@ -3084,7 +3280,7 @@ class ContainerAPI(Resource):
                 message=f"Failed to build runtime environment: {exc}",
                 ip_address=get_current_request_ip(),
             )
-            mark_instance_failed(participant, docker_chal, exc)
+            mark_instance_failed(participant, docker_chal, exc, operation_token=operation_token)
             return abort(500, f"Failed to prepare the challenge runtime: {exc}")
 
         stack_result = None
@@ -3113,7 +3309,7 @@ class ContainerAPI(Resource):
                     message=f"Failed to create stack: {exc}",
                     ip_address=get_current_request_ip(),
                 )
-                mark_instance_failed(participant, docker_chal, exc)
+                mark_instance_failed(participant, docker_chal, exc, operation_token=operation_token)
                 return abort(500, f"Failed to create stack: {exc}")
 
         else:
@@ -3141,7 +3337,7 @@ class ContainerAPI(Resource):
                     message=f"Failed to create container: {exc}",
                     ip_address=get_current_request_ip(),
                 )
-                mark_instance_failed(participant, docker_chal, exc)
+                mark_instance_failed(participant, docker_chal, exc, operation_token=operation_token)
                 return abort(500, f"Failed to create container: {exc}")
 
         try:
@@ -3196,6 +3392,7 @@ class ContainerAPI(Resource):
                     challenge=challenge_label,
                     challenge_id=docker_chal.id,
                     service_name='primary',
+                    network_id=container_result['network_id'],
                     instance_key=instance_key,
                 ))
 
@@ -3211,7 +3408,7 @@ class ContainerAPI(Resource):
                 stack_result=stack_result,
                 container_result=container_result,
             )
-            mark_instance_failed(participant, docker_chal, exc)
+            mark_instance_failed(participant, docker_chal, exc, operation_token=operation_token)
             return abort(500, "The Docker instance started but could not be recorded; it was rolled back")
 
         entries = DockerChallengeTracker.query.filter_by(instance_key=instance_key).all()
@@ -3374,7 +3571,7 @@ class DockerAPI(Resource):
                     return {"success": False, "message": "Image is not currently allowed"}, 404
                 try:
                     ports = get_required_ports(docker, requested_image)
-                except RuntimeError as exc:
+                except (RuntimeError, ValueError) as exc:
                     return {"success": False, "message": str(exc)}, 400
                 return {
                     "success": True,
