@@ -2,7 +2,7 @@
 
 Adds a Docker-backed challenge type to CTFd. Players can start an isolated instance of a challenge container or compose stack, receive a dedicated connection port, and stop or revert their own environment without affecting other competitors.
 
-The plugin publishes challenge ports directly from that same host, so players connect back to the CTFd machine at `HOST:PORT`.
+The plugin publishes challenge ports on the configured Docker worker. Players connect to `DOCKER_CHALLENGE_PUBLIC_HOST:PORT`, which can be a separate FRP gateway/VPS rather than the CTFd host.
 
 ## Screenshots
 
@@ -23,11 +23,12 @@ The plugin publishes challenge ports directly from that same host, so players co
 ![Admin Docker status](docs/screenshots/admin-docker-status.png)
 
 
-## Current Setup does the following:
+## Deployment options
 
-- CTFd talks to Docker through the internal proxy
-- Players connect to the same public hostname they already use for CTFd
-- Challenge containers still run on the same machine as CTFd
+- CTFd can use a separate Docker worker over verified mTLS.
+- The plugin assigns worker ports; a centralized FRPC gateway can forward the whole reserved range.
+- The public challenge hostname/IP is independent of the CTFd web hostname.
+- A local internal socket proxy remains an alternative for existing single-host deployments.
 
 ## Installation
 
@@ -53,7 +54,181 @@ CTFd/plugins/docker_challenges
 /admin/docker_status
 ```
 
-## Recommended Docker Proxy Setup
+## Remote worker with mTLS and centralized FRP (UTSA example)
+
+This is a review/deployment example, not a script to apply to the existing
+production Compose stack or restart its services. The patch is prepared against
+plugin commit `d4be6ad24b7cbb62f910597764bdfd52a692dac9` for CTFd 3.8.8.
+
+| Role | Endpoint |
+| --- | --- |
+| CTFd web/application host | `172.16.100.46` |
+| Dedicated Docker worker | `172.16.100.50` |
+| Verified Docker API | `ctf-docker.utsacyber.local:2376` |
+| VPN/FRPC gateway | `172.16.100.38` |
+| Public VPS/FRPS | `172.93.163.183` |
+| Reserved published challenge ports | `30000`–`30009` |
+| Worker bridge address pool | `10.80.0.0/16`, split into `/24`s |
+
+```text
+CTFd .46 -- HTTPS + client certificate --> Docker worker .50:2376
+Players --> VPS/FRPS 172.93.163.183:30000-30009
+             == existing authenticated, verified FRP tunnel ==>
+               FRPC gateway .38 --> worker .50:30000-30009
+```
+
+The plugin creates no FRP processes, per-challenge FRPC containers, or proxies.
+Forwarding is static and centralized; an unused/expired worker port should stop
+accepting connections even though its FRP proxy remains registered.
+
+### CTFd-side settings
+
+For a future approved deployment, pass these environment values to CTFd using
+your normal configuration process (this patch does not edit that stack):
+
+```dotenv
+DOCKER_CHALLENGE_BIND_IP=172.16.100.50
+DOCKER_CHALLENGE_PUBLIC_HOST=172.93.163.183
+DOCKER_CHALLENGE_PORT_MIN=30000
+DOCKER_CHALLENGE_PORT_MAX=30009
+DOCKER_CHALLENGE_MEMORY_LIMIT=512m
+DOCKER_CHALLENGE_CPU_LIMIT=1.0
+DOCKER_CHALLENGE_PIDS_LIMIT=256
+```
+
+In `/admin/docker_config`, set Docker Host to
+`ctf-docker.utsacyber.local:2376`, **TLS Enabled: Yes**, and supply the CA
+certificate, client certificate, and matching private key. The worker certificate
+must have `ctf-docker.utsacyber.local` in its SANs, and that name must resolve to
+`172.16.100.50` from inside CTFd. Configure a nonempty list of reviewed
+repositories. Set the TTL, revert cooldown, and active-instance limit in that UI;
+those stored settings take precedence over environment defaults.
+
+The plugin uses the CA path for Requests' `verify` setting and the certificate/key
+pair for client authentication. Missing/invalid TLS material fails the request;
+there is no insecure/plaintext fallback. This follows Docker's
+[verified TLS guidance](https://docs.docker.com/engine/security/protect-access/).
+Keep the plugin database/backups and certificate material access-controlled.
+
+### Worker requirements
+
+Use the worker's existing verified TLS listener on 2376. Do not add an
+unauthenticated TCP listener, publish the Docker API through FRP, or mount the
+worker socket into a challenge. Restrict worker API access to authorized CTFd
+clients, and restrict challenge-port ingress to the VPN/FRPC gateway. Verify the
+policy with Docker's actual firewall forwarding rules; host firewall rules alone
+may not filter Docker-published ports. Restrict challenge egress toward management
+services as appropriate for the challenge designs.
+
+The worker's reviewed `default-address-pools` configuration should include:
+
+```json
+{"default-address-pools": [{"base": "10.80.0.0/16", "size": 24}]}
+```
+
+This is a worker configuration example only. Do not overwrite existing pools or
+restart Docker as part of applying the plugin patch. Verify that the pool avoids
+LAN/VPN routes and existing networks. Pre-pull the reviewed images on the worker.
+
+`DOCKER_CHALLENGE_BIND_IP` is the **worker's** interface address, not `.46` or the
+FRPC gateway's `.38`. It is separate from the address shown to players. When
+unset, the plugin omits `HostIp` and preserves Docker's default behavior; it does
+not force a new address. IPv6 literals are supported, but their routing and Docker
+bridge/host binding support need validation on the target worker.
+
+### Centralized FRP configuration example
+
+Retain the existing gateway's FRPC authentication and verified TLS configuration.
+The example below shows a complete shape; `7000` is only an example control port,
+and the CA/client paths must match your existing approved deployment. The FRPS
+certificate must be valid for the selected server address (or configure its
+verified DNS SAN as `transport.tls.serverName`). Do not disable verification to
+work around a certificate mismatch.
+
+For FRP versions supporting the
+[port-range template](https://gofrp.org/en/docs/features/common/range/):
+
+```toml
+# Gateway 172.16.100.38: illustrative frpc.toml, not applied by this patch.
+serverAddr = "172.93.163.183"
+serverPort = 7000 # Use the existing FRPS control port.
+auth.method = "token"
+auth.token = "{{ .Envs.FRP_AUTH_TOKEN }}"
+transport.tls.enable = true
+transport.tls.trustedCaFile = "/etc/frp/ca.crt"
+transport.tls.certFile = "/etc/frp/frpc.crt"
+transport.tls.keyFile = "/etc/frp/frpc.key"
+
+{{- range $_, $ports := parseNumberRangePair "30000-30009" "30000-30009" }}
+[[proxies]]
+name = "ctfd-tcp-{{ $ports.First }}"
+type = "tcp"
+localIP = "172.16.100.50"
+localPort = {{ $ports.First }}
+remotePort = {{ $ports.Second }}
+
+[[proxies]]
+name = "ctfd-udp-{{ $ports.First }}"
+type = "udp"
+localIP = "172.16.100.50"
+localPort = {{ $ports.First }}
+remotePort = {{ $ports.Second }}
+{{- end }}
+```
+
+Both TCP and UDP are shown because either can be published by a challenge.
+Provision only the protocols you approve, with unique proxy names. Ensure FRPS
+allows this port range and that its public firewall allows the matching protocols.
+Merge any `allowPorts = [{start = 30000, end = 30009}]` example into the existing
+approved FRPS policy rather than replacing unrelated allowed ports. FRP's
+[configuration validation](https://gofrp.org/en/docs/features/common/configure/)
+and [TLS verification](https://gofrp.org/en/docs/features/common/network/network-tls/)
+documentation describe the relevant checks. No FRP files/services are changed by
+this patch.
+
+### Allocation and capacity
+
+Port availability is read from the **remote** Docker daemon, including other
+applications' allocations and fixed bindings on created/stopped containers. A
+local bind on CTFd is never used as evidence about the worker. Inventory errors
+fail closed. Port numbers are conservatively reserved across all worker addresses
+and both protocols, so this ten-number pool supports at most ten simultaneously
+published bindings; a two-port stack consumes two numbers. Services without
+published ports do not consume this pool.
+
+Inventory cannot observe non-Docker listeners or make a transaction across CTFd
+processes. Docker's create/start response is authoritative: collisions remove the
+failed resources, refresh remote allocations, and retry another port up to
+`DOCKER_CHALLENGE_PORT_RETRIES`. Do not use these ports for unrelated worker
+services. Exhaustion fails the launch and leaves it retryable after cleanup.
+
+## Image and runtime policy
+
+A configured repository allowlist is checked on challenge save and again on every
+launch, including every Compose service. Existing saved challenges do not bypass
+a newly restricted list. Matches are repository names, not prefixes: allowing
+`utsa/web` does not allow `utsa/web-extra` or `utsa/web/other`.
+
+For compatibility, an **empty list permits all worker-local images**. A repository
+entry permits **any tag or digest in that repository**; this is not a signed-image
+or digest approval system. Use a nonempty list and reviewed immutable digest
+references for production challenges. The inspected image must also have a `RepoTags` or `RepoDigests` reference in the
+requested approved repository; a borrowed repository spelling cannot authorize
+an unrelated image ID. After inspection the plugin launches the resolved local
+image ID, so changing a tag between inspection and create cannot
+substitute a different image. It does not pull images automatically.
+
+Participant launch requests select only a saved challenge and start/stop action.
+Extra runtime fields (image, Compose, environment, HostConfig, mounts, ports,
+owner identity) are rejected. The legacy client `name` field is ignored as an image
+selector. Single-image runtime settings are built by the server; authored
+`command`, `entrypoint`, and environment overrides are accepted only through the
+reviewed Compose subset. That subset intentionally allows arbitrary programs
+*inside* the approved container, so challenge authors and images must be trusted.
+Malformed saved published-port selections fail instead of exposing every image
+port as a fallback.
+
+## Alternative Local Docker Proxy Setup
 
 For a single-host deployment, use a local `docker-socket-proxy` service and keep it on an internal Docker network with CTFd.
 
@@ -112,7 +287,7 @@ Open `/admin/docker_config` and configure:
 - **Max Active Challenges**
   Maximum number of active Docker challenge instances per player or team.
 - **Allowed Repositories**
-  Optional image allow-list shown to challenge authors.
+  Repository allowlist enforced when saving and launching, not just displayed in the author UI. See the image/runtime policy below.
 
 ## Host and Server Configuration
 
@@ -145,34 +320,66 @@ If CTFd is behind a reverse proxy or the public hostname should be fixed explici
 DOCKER_CHALLENGE_PUBLIC_HOST=ctf.example.com
 ```
 
-### Size Docker Networks for Compose Challenges
+### Size Docker Networks for Challenge Instances
 
-Each running Compose stack uses one bridge network. For **X** concurrent teams, choose a nonoverlapping pool with more than X subnets to leave room for other Docker networks. A base prefix `/B` split with `size: 24` provides up to `2^(24-B)` networks; the example below provides up to 4,096 `/24` networks and supported our 70-team test.
+Each running single-image instance or Compose stack uses one bridge network.
+Count active **instances**, including multiple challenges per team/user. Choose
+a nonoverlapping pool with spare subnets for in-progress launches and other
+Docker networks. A base prefix `/B` split with `size: 24` provides up to
+`2^(24-B)` networks; the example below provides up to 256 `/24` networks.
 
 ```json
 {
   "default-address-pools": [
-    { "base": "10.80.0.0/12", "size": 24 }
+    { "base": "10.80.0.0/16", "size": 24 }
   ]
 }
 ```
 
-Add this to `/etc/docker/daemon.json` and restart Docker during maintenance.
+Review worker address pools as a separate approved maintenance task. This plugin
+patch does not apply daemon configuration or restart Docker.
 
 ### Pre-Pull Challenge Images
 
 Pull challenge images onto the host before the event so launches are fast and predictable.
 
-### Optional Global Resource Limits
+### Global Resource and Security Defaults
 
-You can apply default limits to all launched services:
+Both single-image containers and every Compose service default to `512m` memory,
+one CPU, and 256 PIDs. These are per-container limits, not a total stack budget.
+You can change these defaults with:
 
 ```bash
 DOCKER_CHALLENGE_MEMORY_LIMIT=512m
 DOCKER_CHALLENGE_CPU_LIMIT=1.0
+DOCKER_CHALLENGE_PIDS_LIMIT=256
 ```
 
-These act as defaults. Compose services can also set `mem_limit` and `cpus` individually.
+Compose services can explicitly set positive `mem_limit`, `cpus`, and `pids_limit`
+within the existing ceilings (16 GiB, 64 CPUs, 32768 PIDs). Invalid operator limits
+now reject a launch rather than silently removing its limit. This changes the
+previous unlimited default when memory/CPU settings were unset.
+
+Both launch paths use private PID/IPC namespaces, `Privileged: false`,
+`no-new-privileges:true`, and drop `NET_RAW`. Normal Docker capabilities other
+than `NET_RAW` remain available so common database entrypoints can switch user
+and initialize files. Compose `cap_drop` adds restrictions; it cannot restore
+`NET_RAW` or remove no-new-privileges. Filesystems remain writable by default;
+Compose can opt into `read_only: true`.
+
+Every `cap_add` is rejected, including dangerous capabilities such as
+`SYS_ADMIN`, `NET_ADMIN`, and `ALL`. Privileged mode, host/container networking or
+PID/IPC sharing, devices, Docker socket mounts, host binds, `volumes_from`, custom
+runtimes, and security profile overrides are rejected by the Compose subset.
+Named Compose volumes remain unsupported, as before. Image-declared anonymous
+volumes are allowed and removed with their container during cleanup. Services
+still communicate by their aliases on their instance's private bridge network.
+
+Review setuid/file-capability and raw-socket challenges before use: the shared
+security baseline intentionally prevents those privilege transitions/raw
+sockets. A separate worker, reviewed images, Docker's normal seccomp/AppArmor
+profiles, and worker firewall/egress policy are still required; these settings
+are not a sandbox against kernel or Docker vulnerabilities.
 
 ## Environment Variables
 
@@ -180,6 +387,7 @@ These act as defaults. Compose services can also set `mem_limit` and `cpus` indi
 | --- | --- | --- |
 | `DOCKER_CHALLENGE_PORT_MIN` | First host port available for challenge instances | `30000` |
 | `DOCKER_CHALLENGE_PORT_MAX` | Last host port available for challenge instances | `60000` |
+| `DOCKER_CHALLENGE_BIND_IP` | Literal IPv4/IPv6 address on the Docker worker used for every published port; invalid/scoped/multicast addresses reject launches | unset: omit `HostIp`, retaining Docker's binding default |
 | `DOCKER_CHALLENGE_PUBLIC_HOST` | Player-facing hostname for connection details | request host |
 | `DOCKER_CHALLENGE_HMAC_SECRET` | Secret used for per-participant HMAC flag generation | CTFd `SECRET_KEY` |
 | `DOCKER_CHALLENGE_REQUEST_TIMEOUT` | Docker API timeout in seconds | `10` |
@@ -187,8 +395,9 @@ These act as defaults. Compose services can also set `mem_limit` and `cpus` indi
 | `DOCKER_CHALLENGE_REVERT_COOLDOWN` | Default revert cooldown if not set in the admin UI | `300` |
 | `DOCKER_CHALLENGE_CONTAINER_TTL` | Default instance TTL if not set in the admin UI | `7200` |
 | `DOCKER_CHALLENGE_MAX_ACTIVE` | Default max active instances if not set in the admin UI | `0` |
-| `DOCKER_CHALLENGE_MEMORY_LIMIT` | Default memory limit for launched services | unset |
-| `DOCKER_CHALLENGE_CPU_LIMIT` | Default CPU limit for launched services | unset |
+| `DOCKER_CHALLENGE_MEMORY_LIMIT` | Default per-container memory limit | `512m` |
+| `DOCKER_CHALLENGE_CPU_LIMIT` | Default per-container CPU limit | `1.0` |
+| `DOCKER_CHALLENGE_PIDS_LIMIT` | Default per-container PID limit | `256` |
 | `DOCKER_CHALLENGE_MAX_SERVICES` | Max services allowed in one compose challenge | `8` |
 | `DOCKER_CHALLENGE_MAX_PUBLISHED_PORTS` | Max published ports allowed for one challenge instance | `16` |
 | `DOCKER_CHALLENGE_PORT_RETRIES` | Port allocation retry attempts when Docker reports collisions | `5` |
@@ -208,6 +417,9 @@ Requirements:
 - The image must already exist on the host
 - The image must expose at least one port in its Docker metadata
 - Select which exposed container ports should be published to players. The plugin assigns the host-side ports automatically for each instance.
+
+Each launch also creates a dedicated bridge network. The container attaches only
+to that network, rather than Docker's shared default `bridge` network.
 
 ### Compose Stack Mode
 
@@ -297,6 +509,7 @@ Supported service fields are listed below. Other service fields are rejected so 
 - `cap_drop`
 - `read_only`
 - `pids_limit`
+- `shm_size`
 
 Common unsupported host-level options are rejected, including:
 
@@ -374,3 +587,115 @@ Use these pages during the event:
   Review active instances, lifecycle state, expiry times, and recent lifecycle actions.
 
 The plugin records each logical instance as `creating`, `running`, `deleting`, `stopped`, or `failed`. Its background cleanup also reconciles plugin-labeled Docker containers and networks with the database, removes abandoned resources, and clears trackers for containers that exited or disappeared.
+
+### Instance network isolation and upgrades
+
+Single-image challenges and Compose stacks both use one dedicated bridge per
+team/user and challenge instance. Compose services share their instance's bridge
+and retain service-name DNS aliases and dependency ordering. Network names are
+unique to the creation operation; a delayed or failed launch cannot reuse or
+remove the network from a newer launch. Containers attach using the returned
+Docker network ID, and the existing tracker `network_id` column records it.
+
+Networks carry `ctfd.plugin`, `ctfd.challenge.id`, `ctfd.owner.id`,
+`ctfd.owner.mode`, `ctfd.instance.key`, and `ctfd.operation.token` labels (plus
+`ctfd.stack.id` for Compose). Cleanup inspects labels and endpoints before
+deletion. It never removes Docker's built-in `bridge`, `host`, or `none` networks,
+or disconnects unknown containers to force a network removal. Stop, revert,
+expiry, solve cleanup, and challenge deletion all remove the instance network
+after its containers. A failed network deletion retains tracker rows for retry.
+The reaper also removes labeled orphan networks after failed launches, lost API
+replies, or missing containers; recent matching creation reservations are
+protected for the existing ten-minute reconciliation grace period. Worker/API
+outages or foreign attached endpoints can delay cleanup until a later retry or
+administrator intervention. Networks without sufficient ownership labels are
+left for manual review.
+
+No new database migration, Compose challenge field, or environment variable is
+needed. Existing single-image instances with no `network_id` remain on the
+legacy default bridge until they are stopped/reverted/expired/solved. They are
+**not retroactively isolated**. After a future approved deployment, stop and
+restart or revert those instances during maintenance; new launches get dedicated
+networks. Existing Compose trackers and labeled networks remain supported,
+including labels predating `ctfd.instance.key` and operation tokens. Review
+address-pool capacity for all instances before deployment. Rolling back to the
+older plugin can leave new single-image networks until its orphan reaper runs.
+
+The patch keeps Docker's normal bridge/NAT/address-pool defaults and published
+port bindings; it does not edit worker, firewall, or FRP configuration. Docker's
+[bridge isolation](https://docs.docker.com/engine/network/drivers/bridge/)
+separates direct container traffic across bridges, but **published host ports
+and external routes remain reachable according to existing firewall policy**.
+This is not an egress firewall or isolation from the Docker host. Verify real
+cross-instance private-IP connectivity is blocked, same-instance Compose DNS
+works, and published ports still work through FRP in a separate staging test.
+
+
+## Testing this patch without production services
+
+Use a testing checkout named `docker_challenges`, Python 3.11, and a separate
+copy of the **official CTFd 3.8.8 source** inside this checkout. The runner imports the plugin under a temporary application
+context, exercises actual CTFd models/API decorators against disposable SQLite
+files, and blocks outbound HTTP requests. Docker is an in-memory fake: no daemon,
+production database, Redis server, Docker container, or FRP service is required.
+It does not call the plugin loader or start its reaper thread.
+
+```bash
+# Run in a testing checkout, never the production plugin directory.
+mkdir -p .test-env
+# If not already present:
+git clone --depth 1 --branch 3.8.8 https://github.com/CTFd/CTFd.git .test-env/CTFd
+python3.11 -m venv .test-env/venv
+.test-env/venv/bin/python -m pip install \
+  -r .test-env/CTFd/requirements.txt -r requirements-test.txt
+PYTHON="$PWD/.test-env/venv/bin/python" ./tests/run.sh -q
+.test-env/venv/bin/python -m py_compile __init__.py tests/*.py
+```
+
+`CTFD_TEST_SOURCE` can point to another isolated 3.8.8 source copy. Test artifacts,
+SQLite files, logs, and downloaded runtimes belong in `.test-env/` or `.artifacts/`,
+which Git ignores. The test runner fixes its temporary-file root inside this
+checkout. The bootstrap application uses an in-memory database. Compatibility
+with local changes to the UTSA CTFd fork still requires staging verification.
+
+Coverage includes TCP/UDP and IPv4/IPv6 `HostIp`, malformed bind addresses,
+remote running/created/stopped bindings and inspection failures, non-Docker
+listener collisions, concurrent port races in both launch modes, restricted
+Compose fields, allowlist checks at save and launch, image-ID pinning, shared
+limits/security defaults, mTLS verification and temporary key cleanup,
+participant/team tracking, TTL and solved-instance cleanup, revert cooldown,
+cleanup failure retries, per-instance network membership and ownership checks,
+Compose DNS, legacy-bridge compatibility, abandoned-network reconciliation,
+lost Docker replies, tracker-persistence failures, and overlapping start/stop
+requests. Locked lifecycle
+reads refresh the ORM identity map; operation tokens prevent old requests from
+deleting or failing newer instances. A name collision with a different token is
+left for reconciliation/administrator review instead of deleting that resource.
+
+### Manual verification before a production rollout
+
+- Review the diff against the pinned plugin commit and the local CTFd fork.
+  The patch changes runtime defaults and does not include a database migration.
+- In a separate staging deployment, verify the real worker's server/client
+  certificate chain, DNS SAN, client authorization, interface ownership, Docker
+  API compatibility, CPU/memory/PID enforcement, and supported IPv6 bindings if
+  used. The automated tests do not connect to the worker.
+- Verify browser create/update/start/stop/revert flows, standard and HMAC flags,
+  team ownership, max-active limits, and the real reaper's scheduled execution.
+  Verify local UTSA module/scheduling/access policy alongside the plugin API;
+  this patch does not claim to audit that fork's complete challenge ACL model.
+- Exercise a multi-service web/database challenge: service-name DNS, writable
+  paths, port placeholders, and NNP/NET_RAW compatibility. Both launch modes now
+  use per-instance bridges. Verify containers cannot reach other instances by
+  private IP, while same-instance service DNS works. Published host ports remain
+  governed by existing firewall rules. Worker firewall/egress controls must
+  isolate challenge traffic from management hosts.
+- Check real simultaneous launches across the deployed Gunicorn workers and
+  MariaDB transactions. SQLite/fake-Docker tests do not reproduce all engine,
+  kernel, cgroup, or database locking behavior. Test worker outages, exhausted
+  ten-port capacity, cleanup failures, and expired/solved-instance reconciliation.
+- Validate the proposed FRPC/FRPS configuration separately without replacing or
+  restarting existing services. Then, during an approved staging test, verify
+  TCP/UDP end-to-end connections via `172.93.163.183`, and that the same endpoints
+  stop accepting challenge traffic after cleanup. Check both public and worker
+  firewalls; do not forward port 2376 or 2375.
