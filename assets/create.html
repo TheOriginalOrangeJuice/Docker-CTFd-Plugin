@@ -37,7 +37,7 @@
 <div class="form-group" id="compose_group" style="display:none;">
     <label for="compose_content">Docker Compose YAML:
         <i class="far fa-question-circle text-muted cursor-help" data-toggle="tooltip" data-placement="right"
-           title="Paste a docker-compose.yml. Services with 'ports:' will be exposed to the player. Services without ports are internal only. {{HOST}}, {{PORT}}, and {{PORT_service}} placeholders are supported inside environment values, command, and entrypoint."></i>
+           title="Paste a docker-compose.yml. Services with 'ports:' will be exposed to the player. Services without ports are internal only. {{HOST}}, {{PORT}}, {{ENDPOINT}}, {{PORT_service}}, and {{ENDPOINT_service}} placeholders are supported inside environment values, command, and entrypoint."></i>
     </label>
     <small class="form-text text-muted">
         Supported extras: <code>cpus</code> and <code>mem_limit</code> per service. Unsupported host-level options such as <code>volumes</code>, <code>privileged</code>, and <code>build</code> are rejected.

@@ -73,21 +73,20 @@ function createPortRows(item) {
                 const serviceName = CTFd.lib.$("<div>").text(service.service_name).html();
                 lines.push(
                     `<strong>${serviceName} ${mapping.target}/${mapping.protocol}</strong>: ` +
-                    `${item.host}:${mapping.published}`
+                    mapping.endpoint
                 );
             });
             return;
         }
         const servicePorts = service.ports || [];
-        servicePorts.forEach(port => {
-            const cleanPort = String(port).split("/")[0];
+        servicePorts.forEach((port, index) => {
             if (item.is_compose) {
                 lines.push(
                     `<strong>${CTFd.lib.$("<div>").text(service.service_name).html()}</strong>: ` +
-                    `${item.host}:${cleanPort}`
+                    service.endpoints[index]
                 );
             } else {
-                lines.push(`${item.host}:${cleanPort}`);
+                lines.push(service.endpoints[index]);
             }
         });
     });
@@ -105,14 +104,19 @@ function renderConnectionInfo(item) {
         }
 
         let html = $element.data("dockerTemplate");
+        const usesPlaceholders = /\{\{(HOST|PORT|ENDPOINT)/.test(html);
         const mappings = (item.services || []).flatMap(service => service.port_mappings || []);
-        html = html.replace(/\{\{PORT_(\d+)\}\}/g, (match, target) => {
+        html = html.replace(/\{\{(PORT|ENDPOINT)_(\d+)\}\}/g, (match, kind, target) => {
             const mapping = mappings.find(entry => String(entry.target) === target);
-            return mapping ? String(mapping.published) : match;
+            if (!mapping) {
+                return match;
+            }
+            return kind === "PORT" ? String(mapping.published) : mapping.endpoint;
         });
-        if (html.includes("{{HOST}}") || html.includes("{{PORT}}")) {
+        if (usesPlaceholders) {
             html = html.replace(/\{\{HOST\}\}/g, item.host || "");
             html = html.replace(/\{\{PORT\}\}/g, firstPort || "");
+            html = html.replace(/\{\{ENDPOINT\}\}/g, item.endpoint || "");
         } else {
             html = html.replace(/\bhost\b/gi, item.host || "");
             html = html.replace(/\bport\b/gi, firstPort || "");

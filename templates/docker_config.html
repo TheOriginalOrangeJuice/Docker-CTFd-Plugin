@@ -52,6 +52,29 @@
                 </div>
 
                 <div class="card mb-4">
+                    <div class="card-header"><strong>Player Access</strong></div>
+                    <div class="card-body">
+                        <div class="form-group mb-0">
+                            <p class="mb-2">Subdomain Mode?</p>
+                            <div class="form-check form-check-inline">
+                                <input type="radio" name="use_subdomains" id="subdomains-radiobox-yes" value="True" {% if use_subdomains %}checked{% endif %} />
+                                <label for="subdomains-radiobox-yes">Yes: <code>k7m2q5x3t9wz4bq2.{{ public_host }}</code></label>
+                            </div>
+                            <div class="form-check form-check-inline">
+                                <input type="radio" name="use_subdomains" id="subdomains-radiobox-no" value="False" {% if not use_subdomains %}checked{% endif %} />
+                                <label for="subdomains-radiobox-no">No: <code>{{ public_host }}:36753</code></label>
+                            </div>
+                            <small class="form-text text-muted">
+                                Subdomain mode gives each instance port an encrypted label that only your reverse proxy can decrypt, so players can't guess each other's URLs.
+                                The proxy needs the same <code>DOCKER_CHALLENGE_ROUTE_KEY</code> and the decoder from the plugin's <code>nginx/</code> folder, plus a wildcard DNS record for <code>*.{{ public_host }}</code>.
+                                Without the key, new instances use <code>host:port</code>.
+                                The setting applies to newly started instances. A stopped instance's ports aren't reused until its labels expire (one instance TTL after it started).
+                            </small>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card mb-4">
                     <div class="card-header"><strong>Instance Defaults</strong></div>
                     <div class="card-body">
                         <div class="form-row">

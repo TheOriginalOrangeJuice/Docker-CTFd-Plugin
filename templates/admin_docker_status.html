@@ -38,7 +38,8 @@
                     <div class="text-muted small">Published Port Range</div>
                     <div class="h4 mb-0">{{ settings_summary.port_min }}-{{ settings_summary.port_max }}</div>
                     <div class="small text-muted mt-2">
-                        Reaper every {{ settings_summary.reaper_interval }}s
+                        Subdomain mode {{ "on" if settings_summary.use_subdomains else "off" }}
+                        <br>Reaper every {{ settings_summary.reaper_interval }}s
                         {% if settings_summary.reaper_last_run %}
                         <br>Last run: {{ settings_summary.reaper_last_run | datetimeformat }}
                         {% endif %}
@@ -83,7 +84,9 @@
                                     <td class="text-left" style="white-space: nowrap;">{{ docker.service_name or "-" }}</td>
                                     <td class="text-left"><span class="badge badge-info">{{ docker.state }}</span></td>
                                     <td class="text-left" style="white-space: nowrap;">{{ docker.docker_image }}</td>
-                                    <td class="text-left" style="white-space: nowrap;">{{ docker.ports | join(", ") if docker.ports else "internal only" }}</td>
+                                    <td class="text-left" style="white-space: nowrap;">
+                                        {% for port in docker.ports %}{{ port }} &rarr; {{ docker.endpoints[loop.index0] }}{% if not loop.last %}<br>{% endif %}{% else %}internal only{% endfor %}
+                                    </td>
                                     <td class="text-left">{{ docker.instance_id | truncate(15) }}</td>
                                     <td class="text-left" style="white-space: nowrap;">{{ docker.timestamp | datetimeformat }}</td>
                                     <td class="text-left" style="white-space: nowrap;">{{ docker.expires_at | datetimeformat }}</td>

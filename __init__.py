@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import json
@@ -7,6 +8,7 @@ import random
 import re
 import secrets
 import shlex
+import struct
 import tempfile
 import threading
 import time
@@ -57,6 +59,7 @@ class DockerConfig(db.Model):
     max_active = db.Column("max_active", db.Integer, nullable=True)
     reaper_last_run = db.Column("reaper_last_run", db.Integer, nullable=True)
     reaper_lock_until = db.Column("reaper_lock_until", db.Integer, nullable=True)
+    use_subdomains = db.Column("use_subdomains", db.Boolean, nullable=True)
 
 
 class DockerChallengeTracker(db.Model):
@@ -80,6 +83,13 @@ class DockerChallengeTracker(db.Model):
     ports_json = db.Column('ports_json', db.Text, nullable=True)
     port_mappings_json = db.Column('port_mappings_json', db.Text, nullable=True)
     instance_key = db.Column('instance_key', db.String(160), nullable=True, index=True)
+    route_expires_at = db.Column('route_expires_at', db.Integer, nullable=True)
+
+
+class DockerPortHold(db.Model):
+    """Keeps a port out of allocation until every encrypted label issued for it has expired."""
+    port = db.Column(db.Integer, primary_key=True, autoincrement=False)
+    hold_until = db.Column(db.Integer, nullable=False)
 
 
 class DockerChallengeInstance(db.Model):
@@ -153,6 +163,7 @@ class DockerConfigForm(BaseForm):
         "Docker Hostname", description="The Hostname/IP and Port of your Docker Server"
     )
     tls_enabled = RadioField('TLS Enabled?')
+    use_subdomains = RadioField('Subdomain Mode?')
     ca_cert = FileField('CA Cert')
     client_cert = FileField('Client Cert')
     client_key = FileField('Client Key')
@@ -162,6 +173,7 @@ class DockerConfigForm(BaseForm):
 
 DEFAULT_PORT_MIN = 30000
 DEFAULT_PORT_MAX = 60000
+ROUTE_EPOCH = 1735689600  # 2025-01-01 UTC; route labels store expiry as 24-bit minutes since then
 DEFAULT_REVERT_COOLDOWN = 300
 DEFAULT_CONTAINER_TTL = 7200
 DEFAULT_REQUEST_TIMEOUT = 10
@@ -519,6 +531,55 @@ def get_connection_host_value(docker=None):
     if docker and docker.hostname:
         return extract_host_only(docker.hostname)
     return ""
+
+
+def uses_subdomains(docker):
+    # Unset (NULL) counts as on, so subdomain mode is the default.
+    return docker is None or docker.use_subdomains is not False
+
+
+def get_route_key():
+    return os.environ.get("DOCKER_CHALLENGE_ROUTE_KEY", "")
+
+
+def get_route_expires_at(docker, now):
+    """Expiry to seal into a new instance's labels, or None when it should use host:port."""
+    # Labels sealed without a key could be forged by anyone.
+    if not (uses_subdomains(docker) and get_route_key()):
+        return None
+    expires_at = now + get_container_ttl(docker)
+    return expires_at + -expires_at % 60  # Labels store whole minutes.
+
+
+def encode_route_label(port, expires_at):
+    """Encrypt (port, expiry) into a 16-character DNS label that only the routing proxy can read.
+
+    Deterministic SIV-style construction over HMAC-SHA256: a 5-byte MAC of the plaintext
+    (port, then expiry in minutes since ROUTE_EPOCH) doubles as the IV for the keystream.
+    nginx/docker_route.lua and nginx/docker_route.js are the matching decoders, so keep all three in sync.
+    """
+    key = get_route_key().encode()
+    mac_key = hmac.new(key, b"docker-route-mac", hashlib.sha256).digest()
+    enc_key = hmac.new(key, b"docker-route-enc", hashlib.sha256).digest()
+    plain = struct.pack(">H", int(port)) + ((int(expires_at) - ROUTE_EPOCH) // 60).to_bytes(3, "big")
+    tag = hmac.new(mac_key, plain, hashlib.sha256).digest()[:5]
+    stream = hmac.new(enc_key, tag, hashlib.sha256).digest()
+    cipher = bytes(p ^ s for p, s in zip(plain, stream))
+    return base64.b32encode(tag + cipher).decode().lower()
+
+
+def format_endpoint(base_host, port, route_expires_at):
+    """Return (connect_host, endpoint) for a published port such as 36753 or "36753/tcp"."""
+    port = str(port).partition("/")[0]
+    if route_expires_at:
+        connect_host = f"{encode_route_label(port, route_expires_at)}.{base_host}"
+        return connect_host, connect_host
+    return base_host, f"{base_host}:{port}"
+
+
+def get_bind_ip():
+    # Empty means all interfaces, Docker's default.
+    return os.environ.get("DOCKER_CHALLENGE_BIND_IP", "")
 
 
 def build_owner_filter(participant):
@@ -1086,6 +1147,7 @@ def define_docker_admin(app):
                 b.ca_cert = None
                 b.client_cert = None
                 b.client_key = None
+            b.use_subdomains = request.form.get('use_subdomains') != "False"
 
             try:
                 b.revert_cooldown = get_config_int_value(
@@ -1132,7 +1194,15 @@ def define_docker_admin(app):
 
         dconfig = get_docker_config()
         selected_repos = normalize_repo_selection(dconfig.repositories if dconfig else None)
-        return render_template("docker_config.html", config=dconfig, form=form, repos=selected_repos, errors=errors)
+        return render_template(
+            "docker_config.html",
+            config=dconfig,
+            form=form,
+            repos=selected_repos,
+            errors=errors,
+            use_subdomains=uses_subdomains(dconfig),
+            public_host=get_connection_host_value(dconfig) or "ctf.example.com",
+        )
 
     app.register_blueprint(admin_docker_config)
 
@@ -1159,6 +1229,8 @@ def define_docker_status(app):
                 user = Users.query.filter_by(id=tracker.user_id).first()
                 display_name = user.name if user else f"User {tracker.user_id}"
 
+            ports = decode_ports(tracker)
+            base_host = tracker.host or get_connection_host_value(docker_config)
             dockers.append({
                 'id': tracker.id,
                 'participant': display_name,
@@ -1170,7 +1242,8 @@ def define_docker_status(app):
                 'timestamp': tracker.timestamp,
                 'revert_time': tracker.revert_time,
                 'expires_at': tracker.timestamp + get_container_ttl(docker_config),
-                'ports': decode_ports(tracker),
+                'ports': ports,
+                'endpoints': [format_endpoint(base_host, port, tracker.route_expires_at)[1] for port in ports],
                 'stack_id': tracker.stack_id,
                 'state': instance_record.state if instance_record else INSTANCE_RUNNING,
             })
@@ -1181,6 +1254,7 @@ def define_docker_status(app):
             'max_active': get_max_active_challenges(docker_config),
             'port_min': get_port_bounds()[0],
             'port_max': get_port_bounds()[1],
+            'use_subdomains': uses_subdomains(docker_config),
             'reaper_interval': get_reaper_interval(),
             'reaper_last_run': docker_config.reaper_last_run if docker_config else None,
         }
@@ -1342,6 +1416,9 @@ def get_unavailable_ports(docker):
             public_port = port.get('PublicPort')
             if public_port is not None:
                 result.append(int(public_port))
+    # A stopped instance's labels stay valid until they expire, so its ports must not be reused before then.
+    now = unix_time(datetime.utcnow())
+    result.extend(hold.port for hold in DockerPortHold.query.filter(DockerPortHold.hold_until > now).all())
     return result
 
 
@@ -1680,7 +1757,7 @@ def create_container_on_network(docker, image, owner_identity, challenge_id, por
             protocol = port_spec.split("/", 1)[1] if "/" in port_spec else "tcp"
             host_port = pick_available_host_port(portbl, protocol=protocol)
             exposed_ports[port_spec] = {}
-            port_bindings[port_spec] = [{"HostPort": str(host_port)}]
+            port_bindings[port_spec] = [{"HostIp": get_bind_ip(), "HostPort": str(host_port)}]
             assigned_host_ports.append(f"{host_port}/{protocol}")
 
         host_config = {
@@ -2207,7 +2284,8 @@ def _topo_sort_services(services):
     return order
 
 
-def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl, labels=None, runtime_env=None):
+def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl, labels=None, runtime_env=None,
+                 route_expires_at=None):
     """Create a multi-container stack from a compose YAML string.
     Returns dict with stack_id, network_id, and containers list."""
     spec = parse_compose_content(compose_yaml_str)
@@ -2254,33 +2332,41 @@ def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl,
                     host_port = pick_available_host_port(portbl, protocol=p['protocol'])
                     port_key = (p['target'], p['protocol'])
                     port_map[svc_name][port_key] = host_port
-                    placeholder_port_map[svc_name].setdefault(p['target'], host_port)
+                    connect_host, endpoint = format_endpoint(host_value, host_port, route_expires_at)
+                    placeholder_port_map[svc_name].setdefault(p['target'], {
+                        'PORT': str(host_port),
+                        'HOST': connect_host,
+                        'ENDPOINT': endpoint,
+                    })
 
-            def _replace_port_placeholders(value):
+            def _replace_port_placeholders(value, own_service):
                 value = str(value)
 
                 def repl_full(match):
-                    service_name, target_port = match.group(1), int(match.group(2))
-                    return str(placeholder_port_map.get(service_name, {}).get(target_port, match.group(0)))
+                    kind, service_name, target_port = match.group(1), match.group(2), int(match.group(3))
+                    found = placeholder_port_map.get(service_name, {}).get(target_port)
+                    return found[kind] if found else match.group(0)
 
                 def repl_svc(match):
-                    service_name = match.group(1)
+                    kind, service_name = match.group(1), match.group(2)
                     ports = placeholder_port_map.get(service_name, {})
-                    return str(next(iter(ports.values()))) if ports else match.group(0)
+                    return next(iter(ports.values()))[kind] if ports else match.group(0)
 
-                value = re.sub(r'\{\{PORT_([A-Za-z0-9_.-]+)_(\d+)\}\}', repl_full, value)
-                value = re.sub(r'\{\{PORT_([A-Za-z0-9_.-]+)\}\}', repl_svc, value)
-                return value.replace('{{HOST}}', host_value)
+                value = re.sub(r'\{\{(PORT|ENDPOINT)_([A-Za-z0-9_.-]+)_(\d+)\}\}', repl_full, value)
+                value = re.sub(r'\{\{(PORT|ENDPOINT)_([A-Za-z0-9_.-]+)\}\}', repl_svc, value)
+                # Bare placeholders refer to the service's own first published port.
+                own = next(iter(placeholder_port_map.get(own_service, {}).values()), None)
+                value = value.replace('{{HOST}}', own['HOST'] if own else host_value)
+                value = value.replace('{{ENDPOINT}}', own['ENDPOINT'] if own else host_value)
+                return value.replace('{{PORT}}', own['PORT'] if own else '')
 
             for svc_name in order:
                 svc = services[svc_name]
                 container_name = build_service_container_name(stack_id, svc_name)
-                own_ports = placeholder_port_map.get(svc_name, {})
-                own_first_port = str(next(iter(own_ports.values()))) if own_ports else ''
 
                 merged_env = {}
                 for key, value in svc['environment'].items():
-                    value = _replace_port_placeholders(value).replace('{{PORT}}', own_first_port)
+                    value = _replace_port_placeholders(value, svc_name)
                     merged_env[key] = value
                 # Runtime identity and HMAC values are authoritative and must
                 # not be shadowed by duplicate Compose environment entries.
@@ -2289,10 +2375,10 @@ def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl,
 
                 cmd = svc.get('command')
                 if isinstance(cmd, str):
-                    cmd = _replace_port_placeholders(cmd).replace('{{PORT}}', own_first_port)
+                    cmd = _replace_port_placeholders(cmd, svc_name)
                 entrypoint = svc.get('entrypoint')
                 if isinstance(entrypoint, str):
-                    entrypoint = _replace_port_placeholders(entrypoint).replace('{{PORT}}', own_first_port)
+                    entrypoint = _replace_port_placeholders(entrypoint, svc_name)
 
                 exposed_ports = {}
                 port_bindings = {}
@@ -2302,7 +2388,7 @@ def create_stack(docker, compose_yaml_str, owner_identity, challenge_id, portbl,
                     key = f"{p['target']}/{p['protocol']}"
                     exposed_ports[key] = {}
                     host_port = port_map[svc_name][(p['target'], p['protocol'])]
-                    port_bindings[key] = [{'HostPort': str(host_port)}]
+                    port_bindings[key] = [{'HostIp': get_bind_ip(), 'HostPort': str(host_port)}]
                     assigned_host_ports.append(f"{host_port}/{p['protocol']}")
                     port_mappings.append({
                         'target': p['target'],
@@ -3224,6 +3310,7 @@ class ContainerAPI(Resource):
 
         now = unix_time(datetime.utcnow())
         host = get_connection_host_value(docker)
+        route_expires_at = get_route_expires_at(docker, now)
         owner_kwargs = get_owner_kwargs(participant)
         challenge_label = docker_chal.name
         instance_key = record.instance_key
@@ -3267,6 +3354,7 @@ class ContainerAPI(Resource):
                     portsbl,
                     labels=common_labels,
                     runtime_env=runtime_env,
+                    route_expires_at=route_expires_at,
                 )
             except Exception as exc:
                 traceback.print_exc()
@@ -3328,11 +3416,12 @@ class ContainerAPI(Resource):
                 )
                 return abort(409, "The Docker lifecycle operation was superseded")
 
+            published_ports = []
             if stack_result:
                 for container in stack_result['containers']:
-                    ports_string, ports_json = encode_ports(
-                        container['ports'].split(',') if container['ports'] else []
-                    )
+                    container_ports = container['ports'].split(',') if container['ports'] else []
+                    published_ports.extend(container_ports)
+                    ports_string, ports_json = encode_ports(container_ports)
                     db.session.add(DockerChallengeTracker(
                         **owner_kwargs,
                         docker_image=container['image'],
@@ -3349,8 +3438,10 @@ class ContainerAPI(Resource):
                         stack_id=stack_result['stack_id'],
                         network_id=stack_result['network_id'],
                         instance_key=instance_key,
+                        route_expires_at=route_expires_at,
                     ))
             else:
+                published_ports.extend(container_result['ports'])
                 ports_string, ports_json = encode_ports(container_result['ports'])
                 db.session.add(DockerChallengeTracker(
                     **owner_kwargs,
@@ -3366,7 +3457,11 @@ class ContainerAPI(Resource):
                     service_name='primary',
                     network_id=container_result.get('network_id'),
                     instance_key=instance_key,
+                    route_expires_at=route_expires_at,
                 ))
+            if route_expires_at:
+                for port in published_ports:
+                    db.session.merge(DockerPortHold(port=int(str(port).split('/')[0]), hold_until=route_expires_at))
 
             locked_record.last_started_at = now
             update_instance_state(locked_record, INSTANCE_RUNNING, operation_token=operation_token, commit=False)
@@ -3463,8 +3558,19 @@ class DockerStatus(Resource):
                         'service_name': entry.service_name or entry.docker_image,
                         'image': entry.docker_image,
                         'ports': service_ports,
-                        'port_mappings': decode_port_mappings(entry),
+                        'endpoints': [
+                            format_endpoint(entry_host, port, entry.route_expires_at)[1] for port in service_ports
+                        ],
+                        'port_mappings': [
+                            {**mapping, 'endpoint': format_endpoint(
+                                entry_host, mapping.get('published'), entry.route_expires_at,
+                            )[1]}
+                            for mapping in decode_port_mappings(entry)
+                        ],
                     })
+                connect_host, endpoint = (
+                    format_endpoint(entry_host, all_ports[0], i.route_expires_at) if all_ports else (entry_host, entry_host)
+                )
                 data.append({
                     'id': i.id,
                     'team_id': i.team_id,
@@ -3478,13 +3584,18 @@ class DockerStatus(Resource):
                     'expires_at': i.timestamp + ttl,
                     'instance_id': i.instance_id,
                     'ports': all_ports,
-                    'host': entry_host,
+                    'host': connect_host,
+                    'endpoint': endpoint,
                     'is_compose': True,
                     'stack_id': i.stack_id,
                     'services': services,
                 })
             else:
                 service_ports = decode_ports(i)
+                connect_host, endpoint = (
+                    format_endpoint(entry_host, service_ports[0], i.route_expires_at)
+                    if service_ports else (entry_host, entry_host)
+                )
                 data.append({
                     'id': i.id,
                     'team_id': i.team_id,
@@ -3498,12 +3609,14 @@ class DockerStatus(Resource):
                     'expires_at': i.timestamp + ttl,
                     'instance_id': i.instance_id,
                     'ports': service_ports,
-                    'host': entry_host,
+                    'host': connect_host,
+                    'endpoint': endpoint,
                     'service_name': i.service_name or 'primary',
                     'services': [{
                         'service_name': i.service_name or 'primary',
                         'image': i.docker_image,
                         'ports': service_ports,
+                        'endpoints': [format_endpoint(entry_host, port, i.route_expires_at)[1] for port in service_ports],
                     }],
                 })
         return {
@@ -3624,6 +3737,8 @@ def _ensure_columns(app):
                     conn.execute(text('ALTER TABLE docker_config ADD COLUMN reaper_last_run INTEGER'))
                 if 'reaper_lock_until' not in config_cols:
                     conn.execute(text('ALTER TABLE docker_config ADD COLUMN reaper_lock_until INTEGER'))
+                if 'use_subdomains' not in config_cols:
+                    conn.execute(text('ALTER TABLE docker_config ADD COLUMN use_subdomains BOOLEAN'))
 
         # DockerChallengeInstance cooldown history
         if insp.has_table('docker_challenge_instance'):
@@ -3655,6 +3770,8 @@ def _ensure_columns(app):
                     conn.execute(text('ALTER TABLE docker_challenge_tracker ADD COLUMN port_mappings_json TEXT'))
                 if 'instance_key' not in tracker_cols:
                     conn.execute(text('ALTER TABLE docker_challenge_tracker ADD COLUMN instance_key VARCHAR(160)'))
+                if 'route_expires_at' not in tracker_cols:
+                    conn.execute(text('ALTER TABLE docker_challenge_tracker ADD COLUMN route_expires_at INTEGER'))
             ensure_index('docker_challenge_tracker', 'ix_docker_challenge_tracker_challenge_id', 'challenge_id')
             ensure_index('docker_challenge_tracker', 'ix_docker_challenge_tracker_service_name', 'service_name')
             ensure_index('docker_challenge_tracker', 'ix_docker_challenge_tracker_instance_key', 'instance_key')
