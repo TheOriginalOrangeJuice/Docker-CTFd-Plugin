@@ -33,7 +33,7 @@ from CTFd.forms import BaseForm
 from CTFd.forms.fields import SubmitField
 from CTFd.models import ChallengeFiles, Challenges, Fails, Flags, Hints, Solves, Tags, Teams, Users, db
 from CTFd.plugins import register_plugin_assets_directory
-from CTFd.plugins.challenges import BaseChallenge, CHALLENGE_CLASSES
+from CTFd.plugins.challenges import BaseChallenge, CHALLENGE_CLASSES, DECAY_FUNCTIONS, calculate_value
 from CTFd.plugins.flags import get_flag_class
 from CTFd.utils.config import is_teams_mode
 from CTFd.utils.config.visibility import challenges_visible
@@ -3033,8 +3033,15 @@ class DockerChallengeType(BaseChallenge):
             ip=get_current_request_ip(),
             provided=submission,
         )
+        challenge_id = challenge.id
+        dynamic = challenge.function in DECAY_FUNCTIONS
         db.session.add(solve)
         db.session.commit()
+        if dynamic:
+            # Serialize recalculations so concurrent solves cannot leave an
+            # older value after a newer one has already been committed.
+            locked = Challenges.query.filter_by(id=challenge_id).with_for_update().one()
+            calculate_value(locked)
 
     @staticmethod
     def fail(user, team, challenge, request):
